@@ -18,7 +18,7 @@
     "README.md"
   ],
   "license": "MIT",
-  "name": "foundry-mcp",
+  "name": "402-foundry-mcp",
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "mcp": "npx -y tsx src/server.ts",

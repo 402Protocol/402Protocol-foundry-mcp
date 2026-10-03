@@ -12,7 +12,7 @@ This wraps the hookit launch tools (which sign and broadcast with zero confirmat
 ## Install
 
 ```bash
-npx -y foundry-mcp
+npx -y 402-foundry-mcp
 ```
 
 Or from source:
@@ -30,7 +30,7 @@ Then add it to your agent's MCP config (Claude Code / Claude Desktop / Cursor):
   "mcpServers": {
     "foundry": {
       "command": "npx",
-      "args": ["-y", "foundry-mcp"],
+      "args": ["-y", "402-foundry-mcp"],
       "env": { "HOOKIT_PRIVATE_KEY": "<launch-wallet-private-key>" }
     }
   }

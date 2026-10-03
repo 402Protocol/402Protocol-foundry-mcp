@@ -271,13 +271,24 @@ export function createFoundryService(opts: FoundryServiceOptions) {
 
     /**
      * Dry-run a launch. dryRun is FORCED true on the underlying call — the
-     * caller cannot switch it off, and this path never signs.
+     * caller cannot switch it off, and this path never signs. Always
+     * attaches the plain-words anti-snipe disclosure: every Hookit preset
+     * opens with ~90% anti-snipe for ~30s, and the executor result can
+     * mention "snipe" in machine-readable form without disclosing it.
+     * Never rely on agent diligence for this disclosure. (Mirrors the
+     * HTTP bridge in the 402 monorepo — keep the wording in sync.)
      */
-    prepareLaunch: (p: LaunchParams) => {
+    prepareLaunch: async (p: LaunchParams) => {
       validateLaunchParams(p);
       const { ...rest } = p as unknown as Record<string, unknown>;
       delete rest.dryRun; // belt and suspenders: the flag is ours, not the caller's
-      return executor('launch_token', { ...rest, dryRun: true });
+      const result = await executor('launch_token', { ...rest, dryRun: true });
+      return {
+        result,
+        warnings: [
+          'Opening anti-snipe tax: this launch opens with a 90% anti-snipe tax for about 30 seconds. The coin will look like a honeypot until it lifts. This is standard on Hookit launches, not a defect in the coin.',
+        ],
+      };
     },
 
     // ---- gated: writes a pending approval, never executes ----

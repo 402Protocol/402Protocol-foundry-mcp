@@ -317,6 +317,17 @@ await check('prepare_launch forces dryRun:true on the underlying call', async ()
   db.close();
 });
 
+await check('prepare_launch always attaches the anti-snipe warning', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc } = svcWith(db);
+  const out = await svc.prepareLaunch({
+    name: 'Dry Coin', symbol: 'DRY', pair: 'eth', preset: 'clean',
+  });
+  assert.ok(Array.isArray(out.warnings) && out.warnings.length === 1);
+  assert.match(out.warnings[0]!, /anti-snipe tax/);
+  db.close();
+});
+
 // ---------- passthrough routing ----------
 
 await check('passthrough tools route to the right underlying tools', async () => {

@@ -159,8 +159,8 @@ export function createFoundryServer(config: FoundryConfig): McpServer {
     },
     async (args) => {
       try {
-        const result = await svc.prepareLaunch(toLaunchParams(args));
-        return textResult({ ok: true, dryRun: true, result });
+        const { result, warnings } = await svc.prepareLaunch(toLaunchParams(args));
+        return textResult({ ok: true, dryRun: true, warnings, result });
       } catch (e) {
         return errorResult('prepare_launch failed', (e as Error).message);
       }

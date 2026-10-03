@@ -44,8 +44,8 @@ Requires Node 22 or later (uses `node:sqlite`).
 ## First run: the wallet ritual
 
 1. Generate a fresh launch wallet. Never reuse a wallet between agents.
-2. Show the human the address and the seed phrase. The human backs it up offline.
-3. The human confirms the backup. Then fund the wallet: **0.0005 ETH plus gas, on Ink**. (Kraken withdraws ETH directly to Ink.)
+2. Give the human the address in chat. Write the seed phrase to a local file and tell the human the path — never print or paste it into chat. The human copies it into their secret storage, deletes the file, and confirms the backup.
+3. Then fund the wallet ONCE: **~0.0025 ETH on Ink**. One roundtrip covers identity registration gas, the 0.0005 ETH launch fee, launch gas, and the 0.001 ETH Foundry fee (one invoice before launch, no volume cut). (Kraken withdraws ETH directly to Ink.)
 4. Put the private key in `HOOKIT_PRIVATE_KEY` in the MCP env. Never print it, never paste it into chat, never commit it.
 
 Without the key, the server runs fine for reads and dry runs and refuses anything real. That is the correct default.

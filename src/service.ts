@@ -48,6 +48,15 @@ export type HookitExecutor = (
 export const HOOKIT_TOOL_TIMEOUT_MS = 180_000;
 
 /**
+ * Foundry platform fee: flat 0.001 ETH per launch, collected at approve
+ * time (before the launch broadcasts) from the launch wallet to the 402
+ * treasury. One-time, no volume cut. Both overridable via env.
+ */
+export const FOUNDRY_FEE_ETH = process.env.FOUNDRY_FEE_ETH ?? '0.001';
+export const FOUNDRY_FEE_RECIPIENT =
+  process.env.FOUNDRY_FEE_RECIPIENT ?? '0xaA4E163dA1545F6967d284C0C5CFA469C644eD23';
+
+/**
  * Default executor: speaks MCP stdio to a `npx -y hookit-mcp` child process.
  * Refuses to run when HOOKIT_PRIVATE_KEY is absent — without a key the child
  * cannot sign, and we fail closed instead of half-working.
@@ -129,6 +138,7 @@ export interface LaunchRecord {
   hookTaxPct: number | null;
   devBuyPct: number | null;
   launchTx: string | null;
+  feeTx: string | null;
   launchedAt: number;
 }
 
@@ -221,12 +231,13 @@ export function createFoundryService(opts: FoundryServiceOptions) {
       hookTaxPct: row.hook_tax_pct,
       devBuyPct: row.dev_buy_pct,
       launchTx: row.launch_tx,
+      feeTx: row.fee_tx,
       launchedAt: row.launched_at,
     };
   }
 
   /** Record a reputation entry after an approved launch executes. */
-  function recordLaunch(approval: ApprovalRow, params: LaunchParams, result: unknown, ts: number): void {
+  function recordLaunch(approval: ApprovalRow, params: LaunchParams, result: unknown, feeTx: string | null, ts: number): void {
     db.insertLaunch({
       id: newId('lnch'),
       erc8004Id: approval.erc8004_id,
@@ -239,6 +250,7 @@ export function createFoundryService(opts: FoundryServiceOptions) {
       hookTaxPct: params.hookTaxPct ?? null,
       devBuyPct: params.devBuyPct ?? null,
       launchTx: extractTxHash(result),
+      feeTx,
       launchedAt: ts,
     });
   }
@@ -303,7 +315,8 @@ export function createFoundryService(opts: FoundryServiceOptions) {
         `on pair ${p.pair} with preset "${p.preset ?? 'default'}"${modules}. ` +
         `Hook tax ${p.hookTaxPct ?? 0}%, dev buy ${p.devBuyPct ?? 0}%, ` +
         `opening snipe tax DISCLOSED at ${p.snipeTaxPct ?? 90}% (standard practice). ` +
-        `Approving will prepare, SIGN, and BROADCAST a real launch transaction on Ink — ` +
+        `Approving first collects the ${FOUNDRY_FEE_ETH} ETH Foundry fee from the launch wallet ` +
+        `to the 402 treasury, then prepares, SIGNs, and BROADCASTs a real launch transaction on Ink — ` +
         `spending the launch fee plus gas from the launch wallet. Nothing is signed until a human approves.`;
       return storeRequest('launch', erc8004Id, params as unknown as Record<string, unknown>, summary);
     },
@@ -334,7 +347,9 @@ export function createFoundryService(opts: FoundryServiceOptions) {
 
     /**
      * Approve a pending request and execute it against the underlying launcher.
-     * The ONLY path by which a real transaction can be signed.
+     * The ONLY path by which a real transaction can be signed. For launches,
+     * the 0.001 ETH Foundry fee is collected first (launch wallet -> 402
+     * treasury); if the fee transfer fails the launch never executes.
      */
     approve: async (approvalId: string) => {
       const row = db.getApproval(approvalId);
@@ -350,13 +365,21 @@ export function createFoundryService(opts: FoundryServiceOptions) {
       const ts = now();
       db.setApprovalStatus(approvalId, 'approved', ts);
       try {
+        let feeTx: string | null = null;
+        if (row.kind === 'launch') {
+          const feeResult = await executor('send_eth', {
+            to: FOUNDRY_FEE_RECIPIENT,
+            amount: FOUNDRY_FEE_ETH,
+          });
+          feeTx = extractTxHash(feeResult);
+        }
         const result = await executor(tool, params);
         const doneTs = now();
         db.setApprovalStatus(approvalId, 'executed', doneTs);
         if (row.kind === 'launch') {
-          recordLaunch(row, params as unknown as LaunchParams, result, doneTs);
+          recordLaunch(row, params as unknown as LaunchParams, result, feeTx, doneTs);
         }
-        return { approval: toApprovalRecord(db.getApproval(approvalId)!), result };
+        return { approval: toApprovalRecord(db.getApproval(approvalId)!), result, feeTx };
       } catch (e) {
         db.setApprovalStatus(approvalId, 'failed', now());
         throw e;

@@ -100,19 +100,20 @@ await check('db: launches insert → list all + by erc8004 id', () => {
     id: 'lnch_1', erc8004Id: '4076', tokenName: 'Test Coin', tokenSymbol: 'TST',
     preset: 'floor', modulesJson: JSON.stringify(['backed-floor']), pair: 'eth',
     snipeTaxPct: 90, hookTaxPct: 5, devBuyPct: 1,
-    launchTx: `0x${'ab'.repeat(32)}`, launchedAt: NOW,
+    launchTx: `0x${'ab'.repeat(32)}`, feeTx: `0x${'cd'.repeat(32)}`, launchedAt: NOW,
   });
   db.insertLaunch({
     id: 'lnch_2', erc8004Id: '9999', tokenName: 'Other', tokenSymbol: 'OTH',
     preset: null, modulesJson: null, pair: 'usdg',
     snipeTaxPct: null, hookTaxPct: null, devBuyPct: null,
-    launchTx: null, launchedAt: NOW + 1,
+    launchTx: null, feeTx: null, launchedAt: NOW + 1,
   });
   assert.equal(db.listLaunches().length, 2);
   const mine = db.listLaunches('4076');
   assert.equal(mine.length, 1);
   assert.equal(mine[0].token_symbol, 'TST');
   assert.equal(mine[0].launch_tx, `0x${'ab'.repeat(32)}`);
+  assert.equal(mine[0].fee_tx, `0x${'cd'.repeat(32)}`);
   db.close();
 });
 
@@ -215,11 +216,16 @@ await check('approve(launch): executes via executor, writes reputation row', asy
 
   assert.equal(approval.status, 'executed');
   assert.equal(approval.decidedAt, NOW);
-  // exactly one underlying call: launch_token, real execution (no dryRun key)
-  assert.equal(mock.calls.length, 1);
-  assert.equal(mock.calls[0].tool, 'launch_token');
-  assert.ok(!('dryRun' in mock.calls[0].params), 'approved launch must not carry dryRun');
-  assert.equal(mock.calls[0].params.name, 'Test Coin');
+  // two underlying calls: the 0.001 ETH platform fee first, then the launch
+  assert.equal(mock.calls.length, 2);
+  assert.equal(mock.calls[0].tool, 'send_eth');
+  assert.deepEqual(mock.calls[0].params, {
+    to: '0xaA4E163dA1545F6967d284C0C5CFA469C644eD23',
+    amount: '0.001',
+  });
+  assert.equal(mock.calls[1].tool, 'launch_token');
+  assert.ok(!('dryRun' in mock.calls[1].params), 'approved launch must not carry dryRun');
+  assert.equal(mock.calls[1].params.name, 'Test Coin');
 
   // reputation: the launch is recorded against the ERC-8004 identity
   const launches = svc.listLaunches('4076');
@@ -231,7 +237,31 @@ await check('approve(launch): executes via executor, writes reputation row', asy
   assert.equal(launches[0].hookTaxPct, 5);
   assert.equal(launches[0].snipeTaxPct, 90);
   assert.equal(launches[0].launchTx, `0x${'ab'.repeat(32)}`);
+  assert.equal(launches[0].feeTx, `0x${'cd'.repeat(32)}`);
   assert.ok(result !== null);
+  db.close();
+});
+
+await check('approve(launch): fee transfer failure blocks the launch', async () => {
+  const db = new FoundryDb(':memory:');
+  const failingFee: HookitExecutor = async (tool, params) => {
+    if (tool === 'send_eth') throw new Error('insufficient funds for fee');
+    throw new Error('should never reach the launcher');
+  };
+  const svc = createFoundryService({ db, executor: failingFee, now: () => NOW });
+  const rec = svc.requestLaunch(launchArgs());
+  await assert.rejects(svc.approve(rec.id), /insufficient funds for fee/);
+  assert.equal(svc.getApproval(rec.id)!.status, 'failed');
+  assert.equal(svc.listLaunches().length, 0);
+  db.close();
+});
+
+await check('requestLaunch summary discloses the platform fee', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc } = svcWith(db);
+  const rec = svc.requestLaunch(launchArgs());
+  assert.match(rec.summary, /0\.001 ETH Foundry fee/);
+  assert.match(rec.summary, /402 treasury/);
   db.close();
 });
 

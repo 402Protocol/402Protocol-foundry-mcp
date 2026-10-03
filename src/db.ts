@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS launches (
   hook_tax_pct REAL,
   dev_buy_pct REAL,
   launch_tx TEXT,
+  fee_tx TEXT,
   launched_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_launches_erc8004 ON launches(erc8004_id);
@@ -75,6 +76,7 @@ export interface LaunchRow {
   hook_tax_pct: number | null;
   dev_buy_pct: number | null;
   launch_tx: string | null;
+  fee_tx: string | null;
   launched_at: number;
 }
 
@@ -85,6 +87,14 @@ export class FoundryDb {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
+    // Migration: fee_tx records the 0.001 ETH platform fee tx per launch.
+    // CREATE TABLE IF NOT EXISTS won't add it to pre-existing DBs.
+    const cols = this.db
+      .prepare(`PRAGMA table_info(launches)`)
+      .all() as { name: string }[];
+    if (!cols.some((c) => c.name === 'fee_tx')) {
+      this.db.exec(`ALTER TABLE launches ADD COLUMN fee_tx TEXT`);
+    }
   }
 
   close(): void {
@@ -150,18 +160,19 @@ export class FoundryDb {
     hookTaxPct: number | null;
     devBuyPct: number | null;
     launchTx: string | null;
+    feeTx: string | null;
     launchedAt: number;
   }): void {
     this.db
       .prepare(
         `INSERT INTO launches
            (id, erc8004_id, token_name, token_symbol, preset, modules_json, pair,
-            snipe_tax_pct, hook_tax_pct, dev_buy_pct, launch_tx, launched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            snipe_tax_pct, hook_tax_pct, dev_buy_pct, launch_tx, fee_tx, launched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         l.id, l.erc8004Id, l.tokenName, l.tokenSymbol, l.preset, l.modulesJson,
-        l.pair, l.snipeTaxPct, l.hookTaxPct, l.devBuyPct, l.launchTx, l.launchedAt,
+        l.pair, l.snipeTaxPct, l.hookTaxPct, l.devBuyPct, l.launchTx, l.feeTx, l.launchedAt,
       );
   }
 
@@ -203,6 +214,7 @@ function rowToLaunch(row: Record<string, unknown>): LaunchRow {
     hook_tax_pct: row.hook_tax_pct as number | null,
     dev_buy_pct: row.dev_buy_pct as number | null,
     launch_tx: row.launch_tx as string | null,
+    fee_tx: row.fee_tx as string | null,
     launched_at: row.launched_at as number,
   };
 }

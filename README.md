@@ -5,8 +5,8 @@ The agent-only token launchpad on Ink, safety-first. Point your agent here, fund
 This wraps the hookit launch tools (which sign and broadcast with zero confirmation gates) in a safety layer:
 
 - **Passthrough (always safe, never signs):** `foundry_list_presets`, `foundry_list_modules`, `foundry_list_pairs`, `foundry_wallet_status`, `foundry_prepare_launch` (forces `dryRun: true`)
-- **Gated (never execute directly):** `foundry_request_launch`, `foundry_request_claim_fees`, `foundry_request_send_eth`. Each writes a pending approval row and returns a plain-words summary. A human flips it with `foundry_approve` / `foundry_reject`. `approve` is the ONLY path that signs and broadcasts.
-- **Reads:** `foundry_approvals`, `foundry_launches` (the per-agent reputation trail)
+- **Gated (never execute directly):** `foundry_request_launch`, `foundry_request_claim_fees`, `foundry_request_send_eth`. Each writes a pending approval row and returns a plain-words summary. A human flips it with `foundry_approve` / `foundry_reject`. `approve` is the ONLY path that signs and broadcasts. Approving a launch first collects the 0.001 ETH Foundry fee (launch wallet → 402 treasury); if the fee transfer fails, the launch never executes.
+- **Reads:** `foundry_approvals`, `foundry_launches` (the per-agent reputation trail; each launch row records the fee tx)
 - **Identity gate:** every `request_*` tool requires the agent's ERC-8004 id. No ID, no launch. Track records accrue to the agent, not the wallet.
 
 ## Install
@@ -45,7 +45,7 @@ Requires Node 22 or later (uses `node:sqlite`).
 
 1. Generate a fresh launch wallet. Never reuse a wallet between agents.
 2. Give the human the address in chat. Write the seed phrase to a local file and tell the human the path — never print or paste it into chat. The human copies it into their secret storage, deletes the file, and confirms the backup.
-3. Then fund the wallet ONCE: **~0.0025 ETH on Ink**. One roundtrip covers identity registration gas, the 0.0005 ETH launch fee, launch gas, and the 0.001 ETH Foundry fee (one invoice before launch, no volume cut). (Kraken withdraws ETH directly to Ink.)
+3. Then fund the wallet ONCE: **~0.0025 ETH on Ink**. One roundtrip covers identity registration gas, the 0.0005 ETH launch fee, launch gas, and the 0.001 ETH Foundry fee (collected at approval, before the launch broadcasts — no volume cut). (Kraken withdraws ETH directly to Ink.)
 4. Put the private key in `HOOKIT_PRIVATE_KEY` in the MCP env. Never print it, never paste it into chat, never commit it.
 
 Without the key, the server runs fine for reads and dry runs and refuses anything real. That is the correct default.

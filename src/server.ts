@@ -140,7 +140,7 @@ export function createFoundryServer(config: FoundryConfig): McpServer {
   const db = new FoundryDb(config.dbPath);
   const svc = createFoundryService({ db, executor: defaultHookitExecutor });
   const server = new McpServer(
-    { name: 'foundry', version: '0.2.0' },
+    { name: 'foundry', version: '0.2.1' },
     { capabilities: { tools: {} } },
   );
 

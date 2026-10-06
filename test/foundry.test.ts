@@ -12,12 +12,18 @@
  * reputation writes (erc8004 id + tx hash recorded).
  *
  * No network, no keys, nothing signed or broadcast. Deterministic.
+ *
+ * 0.2.0 additions: hookit-mcp 0.2.0 tool surface (agent pass, list_coins,
+ * coin_info, buy/sell, floor redeem/borrow/repay), the payout string→object
+ * mapping, modules as a settings object, pairs for multi-pair launches, and
+ * snipeTaxPct kept as disclosure metadata (stripped from the wire).
  */
 import assert from 'node:assert/strict';
 import { FoundryDb } from '../src/db.js';
 import {
   createFoundryService,
   defaultHookitExecutor,
+  normalizePayoutTarget,
   type HookitExecutor,
 } from '../src/service.js';
 import { toLaunchParams } from '../src/server.js';
@@ -34,12 +40,27 @@ async function check(name: string, fn: () => Promise<void> | void) {
   }
 }
 
+/** Hookit-shaped MCP tool result: JSON payload inside content[].text. */
+function hookitResult(payload: unknown, isError = false) {
+  return {
+    content: [{ type: 'text', text: JSON.stringify(payload) }],
+    ...(isError ? { isError: true } : {}),
+  };
+}
+
 /** Mock executor: records calls, returns canned launcher results. */
 function mockExecutor() {
   const calls: { tool: string; params: Record<string, unknown> }[] = [];
   const fn: HookitExecutor = async (tool, params) => {
     calls.push({ tool, params });
+    if (tool === 'wallet_status') {
+      return hookitResult({
+        address: '0xWallet', chain: 'Ink (57073)',
+        balanceEth: '0.01', roughCostEth: '0.002', ready: true,
+      });
+    }
     if (tool === 'launch_token') {
+      if (params.dryRun) return hookitResult({ dryRun: true, verdict: 'The launch is valid.' });
       return { ok: true, launchId: '7', txHash: `0x${'ab'.repeat(32)}` };
     }
     if (tool === 'claim_fees') return { ok: true, claimed: '1.5' };
@@ -47,6 +68,21 @@ function mockExecutor() {
     return { ok: true, tool };
   };
   return { fn, calls };
+}
+
+/** Pre-flight passes: funded wallet + clean simulation. Real launch still fails. */
+function mockPreflightOk(inner: HookitExecutor): HookitExecutor {
+  return async (tool, params) => {
+    if (tool === 'wallet_status') {
+      return hookitResult({
+        address: '0xWallet', balanceEth: '0.01', roughCostEth: '0.002', ready: true,
+      });
+    }
+    if (tool === 'launch_token' && params.dryRun) {
+      return hookitResult({ dryRun: true, verdict: 'The launch is valid.' });
+    }
+    return inner(tool, params);
+  };
 }
 
 const NOW = 1_800_000_000;
@@ -98,13 +134,13 @@ await check('db: launches insert → list all + by erc8004 id', () => {
   const db = new FoundryDb(':memory:');
   db.insertLaunch({
     id: 'lnch_1', erc8004Id: '4076', tokenName: 'Test Coin', tokenSymbol: 'TST',
-    preset: 'floor', modulesJson: JSON.stringify(['backed-floor']), pair: 'eth',
+    tokenAddress: `0x${'11'.repeat(20)}`, preset: 'floor', modulesJson: JSON.stringify(['backed-floor']), pair: 'eth',
     snipeTaxPct: 90, hookTaxPct: 5, devBuyPct: 1,
     launchTx: `0x${'ab'.repeat(32)}`, feeTx: `0x${'cd'.repeat(32)}`, launchedAt: NOW,
   });
   db.insertLaunch({
     id: 'lnch_2', erc8004Id: '9999', tokenName: 'Other', tokenSymbol: 'OTH',
-    preset: null, modulesJson: null, pair: 'usdg',
+    tokenAddress: null, preset: null, modulesJson: null, pair: 'usdg',
     snipeTaxPct: null, hookTaxPct: null, devBuyPct: null,
     launchTx: null, feeTx: null, launchedAt: NOW + 1,
   });
@@ -216,16 +252,20 @@ await check('approve(launch): executes via executor, writes reputation row', asy
 
   assert.equal(approval.status, 'executed');
   assert.equal(approval.decidedAt, NOW);
-  // two underlying calls: the 0.001 ETH platform fee first, then the launch
-  assert.equal(mock.calls.length, 2);
-  assert.equal(mock.calls[0].tool, 'send_eth');
-  assert.deepEqual(mock.calls[0].params, {
-    to: '0xaA4E163dA1545F6967d284C0C5CFA469C644eD23',
-    amount: '0.001',
-  });
+  // four underlying calls: pre-flight wallet_status + dryRun simulation,
+  // then the real launch, then the 0.001 ETH platform fee (fee-after-launch)
+  assert.equal(mock.calls.length, 4);
+  assert.equal(mock.calls[0].tool, 'wallet_status');
   assert.equal(mock.calls[1].tool, 'launch_token');
-  assert.ok(!('dryRun' in mock.calls[1].params), 'approved launch must not carry dryRun');
-  assert.equal(mock.calls[1].params.name, 'Test Coin');
+  assert.equal(mock.calls[1].params.dryRun, true);
+  assert.equal(mock.calls[2].tool, 'launch_token');
+  assert.ok(!('dryRun' in mock.calls[2].params), 'approved launch must not carry dryRun');
+  assert.equal(mock.calls[2].params.name, 'Test Coin');
+  assert.equal(mock.calls[3].tool, 'send_eth');
+  assert.deepEqual(mock.calls[3].params, {
+    to: '0xaA4E163dA1545F6967d284C0C5CFA469C644eD23',
+    amountEth: '0.001', // hookit-mcp's param name, not `amount`
+  });
 
   // reputation: the launch is recorded against the ERC-8004 identity
   const launches = svc.listLaunches('4076');
@@ -238,21 +278,129 @@ await check('approve(launch): executes via executor, writes reputation row', asy
   assert.equal(launches[0].snipeTaxPct, 90);
   assert.equal(launches[0].launchTx, `0x${'ab'.repeat(32)}`);
   assert.equal(launches[0].feeTx, `0x${'cd'.repeat(32)}`);
+  assert.equal(approval.feeTx, `0x${'cd'.repeat(32)}`);
   assert.ok(result !== null);
   db.close();
 });
 
-await check('approve(launch): fee transfer failure blocks the launch', async () => {
+await check('approve(launch): launch failure collects no fee', async () => {
   const db = new FoundryDb(':memory:');
-  const failingFee: HookitExecutor = async (tool, params) => {
-    if (tool === 'send_eth') throw new Error('insufficient funds for fee');
-    throw new Error('should never reach the launcher');
-  };
-  const svc = createFoundryService({ db, executor: failingFee, now: () => NOW });
+  const calls: string[] = [];
+  const launchFails = mockPreflightOk(async (tool, params) => {
+    calls.push(tool);
+    if (tool === 'launch_token' && !params.dryRun) throw new Error('launch broadcast reverted');
+    throw new Error(`must not be called: ${tool}`);
+  });
+  const svc = createFoundryService({ db, executor: launchFails, now: () => NOW });
   const rec = svc.requestLaunch(launchArgs());
-  await assert.rejects(svc.approve(rec.id), /insufficient funds for fee/);
+  await assert.rejects(svc.approve(rec.id), /launch broadcast reverted.*No fee was collected/s);
   assert.equal(svc.getApproval(rec.id)!.status, 'failed');
+  assert.ok(!calls.includes('send_eth'), 'a failed launch must never touch the fee');
+  assert.equal(svc.getApproval(rec.id)!.feeTx, null);
   assert.equal(svc.listLaunches().length, 0);
+  db.close();
+});
+
+await check('approve(launch): launch success + fee failure surfaces the unpaid fee', async () => {
+  const db = new FoundryDb(':memory:');
+  const feeFails = mockPreflightOk(async (tool, params) => {
+    if (tool === 'launch_token' && !params.dryRun) {
+      return hookitResult({ launched: true, token: `0x${'11'.repeat(20)}`, tx: `https://explorer.inkonchain.com/tx/0x${'ab'.repeat(32)}` });
+    }
+    if (tool === 'send_eth') throw new Error('fee send ran out of gas');
+    throw new Error(`must not be called: ${tool}`);
+  });
+  const svc = createFoundryService({ db, executor: feeFails, now: () => NOW });
+  const rec = svc.requestLaunch(launchArgs());
+  const { approval, feeTx, feeWarning } = await svc.approve(rec.id);
+  // the launch stands: status executed, row recorded, fee marked unpaid
+  assert.equal(approval.status, 'executed');
+  assert.equal(feeTx, null);
+  assert.match(feeWarning ?? '', /fee is still due to the 402 treasury/);
+  const launches = svc.listLaunches('4076');
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].feeTx, null);
+  assert.equal(launches[0].tokenAddress, `0x${'11'.repeat(20)}`);
+  db.close();
+});
+
+await check('approve(launch): pre-flight blocks an underfunded wallet before the fee moves', async () => {
+  const db = new FoundryDb(':memory:');
+  const calls: string[] = [];
+  const broke: HookitExecutor = async (tool, params) => {
+    calls.push(tool);
+    if (tool === 'wallet_status') {
+      return hookitResult({ address: '0xWallet', balanceEth: '0.0004', roughCostEth: '0.002', ready: false });
+    }
+    if (tool === 'launch_token' && params.dryRun) {
+      return hookitResult({ dryRun: true, verdict: 'The launch is valid.' });
+    }
+    throw new Error(`must not be called: ${tool}`);
+  };
+  const svc = createFoundryService({ db, executor: broke, now: () => NOW });
+  const rec = svc.requestLaunch(launchArgs());
+  await assert.rejects(svc.approve(rec.id), /holds 0.0004 ETH but needs/);
+  assert.equal(svc.getApproval(rec.id)!.status, 'failed');
+  assert.ok(!calls.includes('send_eth'), 'fee must never move on a doomed launch');
+  assert.ok(!calls.includes('launch_token'), 'no launch attempt on a doomed pre-flight');
+  assert.equal(svc.listLaunches().length, 0);
+  db.close();
+});
+
+await check('approve(launch): pre-flight blocks a failing simulation before the fee moves', async () => {
+  const db = new FoundryDb(':memory:');
+  const calls: string[] = [];
+  const badSim: HookitExecutor = async (tool, params) => {
+    calls.push(tool);
+    if (tool === 'wallet_status') {
+      return hookitResult({ address: '0xWallet', balanceEth: '0.01', roughCostEth: '0.002', ready: true });
+    }
+    if (tool === 'launch_token' && params.dryRun) {
+      return hookitResult({ dryRun: true, verdict: 'The launch would fail: duplicate symbol' }, true);
+    }
+    throw new Error(`must not be called: ${tool}`);
+  };
+  const svc = createFoundryService({ db, executor: badSim, now: () => NOW });
+  const rec = svc.requestLaunch(launchArgs());
+  await assert.rejects(svc.approve(rec.id), /would fail: duplicate symbol/);
+  assert.equal(svc.getApproval(rec.id)!.status, 'failed');
+  assert.ok(!calls.includes('send_eth'), 'fee must never move on a doomed launch');
+  assert.equal(svc.listLaunches().length, 0);
+  db.close();
+});
+
+await check('approve(launch): fee tx extracted from real hookit-mcp result shape', async () => {
+  const db = new FoundryDb(':memory:');
+  const feeHash = `0x${'ee'.repeat(32)}`;
+  const hookitShaped = mockPreflightOk(async (tool, params) => {
+    if (tool === 'send_eth') {
+      // exactly what hookit-mcp's send_eth returns: JSON-in-string + explorer URL
+      return hookitResult({ sentEth: '0.001', to: '0xtreasury', tx: `https://explorer.inkonchain.com/tx/${feeHash}` });
+    }
+    if (tool === 'launch_token' && !params.dryRun) {
+      const launchHash = `0x${'ff'.repeat(32)}`;
+      return hookitResult({ launched: true, tx: `https://explorer.inkonchain.com/tx/${launchHash}` });
+    }
+    throw new Error(`unexpected: ${tool}`);
+  });
+  const svc = createFoundryService({ db, executor: hookitShaped, now: () => NOW });
+  const rec = svc.requestLaunch(launchArgs());
+  const { approval } = await svc.approve(rec.id);
+  assert.equal(approval.status, 'executed');
+  assert.equal(approval.feeTx, feeHash);
+  const launches = svc.listLaunches('4076');
+  assert.equal(launches[0].feeTx, feeHash);
+  assert.equal(launches[0].launchTx, `0x${'ff'.repeat(32)}`);
+  db.close();
+});
+
+await check('requestLaunch rejects hookTaxPct above hookit range (0-9)', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc } = svcWith(db);
+  assert.throws(() => svc.requestLaunch(launchArgs({ hookTaxPct: 10 })), /between 0 and 9/);
+  assert.throws(() => svc.requestLaunch(launchArgs({ hookTaxPct: 50 })), /between 0 and 9/);
+  // 9 is still fine
+  svc.requestLaunch(launchArgs({ hookTaxPct: 9 }));
   db.close();
 });
 
@@ -285,7 +433,7 @@ await check('approve(send_eth): calls send_eth with to + amount', async () => {
   await svc.approve(rec.id);
   assert.equal(mock.calls.length, 1);
   assert.equal(mock.calls[0].tool, 'send_eth');
-  assert.deepEqual(mock.calls[0].params, { to, amount: '0.05' });
+  assert.deepEqual(mock.calls[0].params, { to, amountEth: '0.05' }); // translated for hookit-mcp
   db.close();
 });
 
@@ -397,6 +545,173 @@ await check('ticker is accepted as an alias for symbol', () => {
   assert.ok(!('erc8004Id' in p));
   const explicit = toLaunchParams({ name: 'Coin', symbol: 'AAA', ticker: 'BBB', pair: 'eth' });
   assert.equal(explicit.symbol, 'AAA'); // explicit symbol wins
+});
+
+// ---------- 0.2.0: payout mapping ----------
+
+await check('normalizePayoutTarget: 0x → wallet, @handle → x, garbage throws', () => {
+  const addr = `0x${'55'.repeat(20)}`;
+  assert.deepEqual(normalizePayoutTarget(addr), { kind: 'wallet', address: addr });
+  assert.deepEqual(normalizePayoutTarget('@somehandle'), { kind: 'x', handle: 'somehandle' });
+  assert.deepEqual(normalizePayoutTarget('somehandle'), { kind: 'x', handle: 'somehandle' });
+  assert.equal(normalizePayoutTarget(undefined), undefined);
+  assert.deepEqual(
+    normalizePayoutTarget({ kind: 'wallet', address: addr }),
+    { kind: 'wallet', address: addr },
+  );
+  assert.throws(() => normalizePayoutTarget('not a target!!!'), /payout must be/);
+  assert.throws(() => normalizePayoutTarget({ kind: 'bogus' }), /payout.kind must be/);
+});
+
+// ---------- 0.2.0: modules object + pairs + snipeTaxPct discipline ----------
+
+await check('prepare_launch: modules object + pairs forwarded, snipeTaxPct stripped, payout mapped', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc, mock } = svcWith(db);
+  const addr = `0x${'66'.repeat(20)}`;
+  await svc.prepareLaunch({
+    name: 'Mod Coin', symbol: 'MOD', pair: 'eth', pairs: ['usdg', 'wnvdax'],
+    preset: 'dynamic', modules: { autoBurn: true, autoBurnPct: 100 },
+    snipeTaxPct: 90, payout: addr,
+  });
+  assert.equal(mock.calls.length, 1);
+  const params = mock.calls[0].params;
+  assert.equal(params.dryRun, true);
+  assert.deepEqual(params.modules, { autoBurn: true, autoBurnPct: 100 });
+  assert.deepEqual(params.pairs, ['usdg', 'wnvdax']);
+  assert.ok(!('snipeTaxPct' in params), 'disclosure metadata never goes over the wire');
+  assert.deepEqual(params.payout, { kind: 'wallet', address: addr });
+  db.close();
+});
+
+await check('prepare_launch rejects an array-shaped modules', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc } = svcWith(db);
+  await assert.rejects(
+    svc.prepareLaunch({ name: 'Bad', symbol: 'BAD', pair: 'eth', modules: ['autoBurn'] as never }),
+    /modules must be a settings object/,
+  );
+  db.close();
+});
+
+// ---------- 0.2.0: new passthrough routing ----------
+
+await check('passthrough: list_coins / coin_info / agent_pass_challenge route correctly', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc, mock } = svcWith(db);
+  await svc.listCoins({ sort: 'gainers', filter: 'ai_agents_only', limit: 10 });
+  await svc.coinInfo(`0x${'77'.repeat(20)}`);
+  await svc.agentPassChallenge();
+  await svc.agentPassChallenge('4076');
+  assert.deepEqual(
+    mock.calls.map((c) => c.tool),
+    ['list_coins', 'coin_info', 'agent_pass_challenge', 'agent_pass_challenge'],
+  );
+  assert.deepEqual(mock.calls[0].params, { sort: 'gainers', filter: 'ai_agents_only', limit: 10 });
+  assert.deepEqual(mock.calls[1].params, { token: `0x${'77'.repeat(20)}` });
+  assert.deepEqual(mock.calls[2].params, {});
+  assert.deepEqual(mock.calls[3].params, { agentId: '4076' });
+  assert.throws(() => svc.coinInfo('not-an-address'), /token must be a 0x coin address/);
+  assert.throws(() => svc.listCoins({ limit: 99 }), /limit must be an integer 1-50/);
+  db.close();
+});
+
+// ---------- 0.2.0: identity gate on the new request tools ----------
+
+await check('gate: new request_* tools require erc8004Id', () => {
+  const db = new FoundryDb(':memory:');
+  const { svc } = svcWith(db);
+  const token = `0x${'88'.repeat(20)}`;
+  assert.throws(() => svc.requestClaimAgentPass({ erc8004Id: '', challengeId: 'ch', answers: ['a'] }), /erc8004Id is required/);
+  assert.throws(() => svc.requestBuyToken({ erc8004Id: 'x', token, amount: '0.01' }), /erc8004Id is required/);
+  assert.throws(() => svc.requestSellToken({ erc8004Id: '', token, amount: 'max' }), /erc8004Id is required/);
+  assert.throws(() => svc.requestRedeemFloor({ erc8004Id: '', token, amount: '10' }), /erc8004Id is required/);
+  assert.throws(() => svc.requestBorrowFloor({ erc8004Id: '', token, amount: '10' }), /erc8004Id is required/);
+  assert.throws(() => svc.requestRepayLoan({ erc8004Id: '' }), /erc8004Id is required/);
+  db.close();
+});
+
+// ---------- 0.2.0: new gated flows ----------
+
+await check('approve(claim_agent_pass): challengeId→id, erc8004Id→agentId', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc, mock } = svcWith(db);
+  const rec = svc.requestClaimAgentPass({
+    erc8004Id: '4076', challengeId: 'ch_1', answers: ['seven', 42],
+  });
+  assert.equal(rec.status, 'pending');
+  assert.match(rec.summary, /ERC-8004 validation/);
+  const { approval } = await svc.approve(rec.id);
+  assert.equal(approval.status, 'executed');
+  assert.equal(mock.calls.length, 1);
+  assert.equal(mock.calls[0].tool, 'claim_agent_pass');
+  assert.deepEqual(mock.calls[0].params, { id: 'ch_1', answers: ['seven', 42], agentId: '4076' });
+  assert.equal(svc.listLaunches().length, 0);
+  db.close();
+});
+
+await check('requestBuyToken validation: bad token, bad slippage', () => {
+  const db = new FoundryDb(':memory:');
+  const { svc } = svcWith(db);
+  assert.throws(() => svc.requestBuyToken({ erc8004Id: '4076', token: 'nope', amount: '0.01' }), /token must be a 0x coin address/);
+  assert.throws(
+    () => svc.requestBuyToken({ erc8004Id: '4076', token: `0x${'88'.repeat(20)}`, amount: '0.01', slippageBps: 99999 }),
+    /slippageBps must be an integer between 1 and 5000/,
+  );
+  assert.throws(
+    () => svc.requestBorrowFloor({ erc8004Id: '4076', token: `0x${'88'.repeat(20)}`, amount: '10', days: 45 }),
+    /days must be one of/,
+  );
+  db.close();
+});
+
+await check('approve(buy_token): exact params, no launch row', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc, mock } = svcWith(db);
+  const token = `0x${'99'.repeat(20)}`;
+  const rec = svc.requestBuyToken({
+    erc8004Id: '4076', token, amount: '0.01', payWith: 'usdg', slippageBps: 100,
+  });
+  assert.match(rec.summary, /0\.01/);
+  const { approval } = await svc.approve(rec.id);
+  assert.equal(approval.status, 'executed');
+  assert.equal(mock.calls.length, 1);
+  assert.equal(mock.calls[0].tool, 'buy_token');
+  assert.deepEqual(mock.calls[0].params, { token, amount: '0.01', payWith: 'usdg', slippageBps: 100 });
+  assert.equal(svc.listLaunches().length, 0);
+  db.close();
+});
+
+await check('approve routes sell/redeem/borrow/repay to the right tools', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc, mock } = svcWith(db);
+  const token = `0x${'aa'.repeat(20)}`;
+  const s = await svc.approve(svc.requestSellToken({ erc8004Id: '4076', token, amount: 'max' }).id);
+  const r = await svc.approve(svc.requestRedeemFloor({ erc8004Id: '4076', token, amount: '50%' }).id);
+  const b = await svc.approve(svc.requestBorrowFloor({ erc8004Id: '4076', token, amount: '1000', days: 14 }).id);
+  const p = await svc.approve(svc.requestRepayLoan({ erc8004Id: '4076' }).id);
+  assert.deepEqual(
+    mock.calls.map((c) => c.tool),
+    ['sell_token', 'redeem_floor', 'borrow_against_floor', 'repay_loan'],
+  );
+  assert.deepEqual(mock.calls[0].params, { token, amount: 'max' });
+  assert.deepEqual(mock.calls[2].params, { token, amount: '1000', days: 14 });
+  assert.deepEqual(mock.calls[3].params, {});
+  for (const a of [s, r, b, p]) assert.equal(a.approval.status, 'executed');
+  db.close();
+});
+
+await check('approve(launch): snipeTaxPct stripped from the wire, kept on the row', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc, mock } = svcWith(db);
+  const rec = svc.requestLaunch(launchArgs({ snipeTaxPct: 90 }));
+  await svc.approve(rec.id);
+  const launchCall = mock.calls.find((c) => c.tool === 'launch_token' && !c.params.dryRun)!;
+  assert.ok(!('snipeTaxPct' in launchCall.params), 'disclosure metadata never goes over the wire');
+  const row = svc.listLaunches()[0];
+  assert.equal(row.snipeTaxPct, 90);
+  assert.ok(launchCall.params.dryRun !== true);
+  db.close();
 });
 
 console.log(`\n${passed} foundry checks passed`);

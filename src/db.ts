@@ -2,7 +2,9 @@
  * FoundryDb — SQLite state for the Foundry safety wrapper (node:sqlite, DatabaseSync).
  *
  * Tables:
- *   approvals — every gated action request (launch / claim_fees / send_eth).
+ *   approvals — every gated action request (launch / claim_fees / send_eth /
+ *               claim_agent_pass / buy_token / sell_token / redeem_floor /
+ *               borrow_floor / repay_loan).
  *               Rows start pending; a human flips them to approved/rejected;
  *               execution flips them to executed/failed. The approvals table
  *               IS the audit trail: nothing real happens without a row.
@@ -20,7 +22,16 @@ import { dirname } from 'node:path';
 import { mkdirSync } from 'node:fs';
 
 export type ApprovalStatus = 'pending' | 'approved' | 'rejected' | 'executed' | 'failed';
-export type ApprovalKind = 'launch' | 'claim_fees' | 'send_eth';
+export type ApprovalKind =
+  | 'launch'
+  | 'claim_fees'
+  | 'send_eth'
+  | 'claim_agent_pass'
+  | 'buy_token'
+  | 'sell_token'
+  | 'redeem_floor'
+  | 'borrow_floor'
+  | 'repay_loan';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS approvals (
@@ -31,7 +42,8 @@ CREATE TABLE IF NOT EXISTS approvals (
   summary TEXT NOT NULL,
   status TEXT NOT NULL,
   created_at INTEGER NOT NULL,
-  decided_at INTEGER
+  decided_at INTEGER,
+  fee_tx TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_approvals_status ON approvals(status);
 CREATE INDEX IF NOT EXISTS idx_approvals_erc8004 ON approvals(erc8004_id);
@@ -40,6 +52,7 @@ CREATE TABLE IF NOT EXISTS launches (
   erc8004_id TEXT NOT NULL,
   token_name TEXT NOT NULL,
   token_symbol TEXT NOT NULL,
+  token_address TEXT,
   preset TEXT,
   modules_json TEXT,
   pair TEXT NOT NULL,
@@ -62,6 +75,8 @@ export interface ApprovalRow {
   status: ApprovalStatus;
   created_at: number;
   decided_at: number | null;
+  /** 0.001 ETH platform fee tx (launch approvals only, once collected). */
+  fee_tx: string | null;
 }
 
 export interface LaunchRow {
@@ -69,6 +84,8 @@ export interface LaunchRow {
   erc8004_id: string;
   token_name: string;
   token_symbol: string;
+  /** Launched token contract address (links to https://www.hookit.fun/token/<address>). */
+  token_address: string | null;
   preset: string | null;
   modules_json: string | null;
   pair: string;
@@ -87,6 +104,16 @@ export class FoundryDb {
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
+    // Migration: fee_tx on approvals records the 0.001 ETH platform fee tx
+    // for launch approvals. CREATE TABLE IF NOT EXISTS won't add it to
+    // pre-existing DBs, and a fee that succeeded before a failed launch
+    // must stay traceable on the approval row itself.
+    const apprCols = this.db
+      .prepare(`PRAGMA table_info(approvals)`)
+      .all() as { name: string }[];
+    if (!apprCols.some((c) => c.name === 'fee_tx')) {
+      this.db.exec(`ALTER TABLE approvals ADD COLUMN fee_tx TEXT`);
+    }
     // Migration: fee_tx records the 0.001 ETH platform fee tx per launch.
     // CREATE TABLE IF NOT EXISTS won't add it to pre-existing DBs.
     const cols = this.db
@@ -94,6 +121,11 @@ export class FoundryDb {
       .all() as { name: string }[];
     if (!cols.some((c) => c.name === 'fee_tx')) {
       this.db.exec(`ALTER TABLE launches ADD COLUMN fee_tx TEXT`);
+    }
+    // Migration: token_address lets the agent link each launch to its page
+    // on hookit.fun (https://www.hookit.fun/token/<address>).
+    if (!cols.some((c) => c.name === 'token_address')) {
+      this.db.exec(`ALTER TABLE launches ADD COLUMN token_address TEXT`);
     }
   }
 
@@ -135,6 +167,14 @@ export class FoundryDb {
     if (info.changes === 0) throw new Error(`approval not found: ${id}`);
   }
 
+  /** Record the platform fee tx on a launch approval. Throws if the id is unknown. */
+  setApprovalFeeTx(id: string, feeTx: string): void {
+    const info = this.db
+      .prepare('UPDATE approvals SET fee_tx = ? WHERE id = ?')
+      .run(feeTx, id);
+    if (info.changes === 0) throw new Error(`approval not found: ${id}`);
+  }
+
   listApprovals(status?: ApprovalStatus): ApprovalRow[] {
     const rows = status
       ? (this.db
@@ -153,6 +193,7 @@ export class FoundryDb {
     erc8004Id: string;
     tokenName: string;
     tokenSymbol: string;
+    tokenAddress: string | null;
     preset: string | null;
     modulesJson: string | null;
     pair: string;
@@ -166,14 +207,22 @@ export class FoundryDb {
     this.db
       .prepare(
         `INSERT INTO launches
-           (id, erc8004_id, token_name, token_symbol, preset, modules_json, pair,
+           (id, erc8004_id, token_name, token_symbol, token_address, preset, modules_json, pair,
             snipe_tax_pct, hook_tax_pct, dev_buy_pct, launch_tx, fee_tx, launched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
-        l.id, l.erc8004Id, l.tokenName, l.tokenSymbol, l.preset, l.modulesJson,
+        l.id, l.erc8004Id, l.tokenName, l.tokenSymbol, l.tokenAddress, l.preset, l.modulesJson,
         l.pair, l.snipeTaxPct, l.hookTaxPct, l.devBuyPct, l.launchTx, l.feeTx, l.launchedAt,
       );
+  }
+
+  /** Record the platform fee tx on a launch row (collected after the launch). */
+  setLaunchFeeTx(id: string, feeTx: string): void {
+    const info = this.db
+      .prepare('UPDATE launches SET fee_tx = ? WHERE id = ?')
+      .run(feeTx, id);
+    if (info.changes === 0) throw new Error(`launch not found: ${id}`);
   }
 
   listLaunches(erc8004Id?: string): LaunchRow[] {
@@ -198,6 +247,7 @@ function rowToApproval(row: Record<string, unknown>): ApprovalRow {
     status: row.status as ApprovalStatus,
     created_at: row.created_at as number,
     decided_at: row.decided_at as number | null,
+    fee_tx: (row.fee_tx as string | null) ?? null,
   };
 }
 
@@ -207,6 +257,7 @@ function rowToLaunch(row: Record<string, unknown>): LaunchRow {
     erc8004_id: row.erc8004_id as string,
     token_name: row.token_name as string,
     token_symbol: row.token_symbol as string,
+    token_address: (row.token_address as string | null) ?? null,
     preset: row.preset as string | null,
     modules_json: row.modules_json as string | null,
     pair: row.pair as string,

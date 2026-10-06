@@ -1,15 +1,19 @@
 /**
  * Foundry MCP server — the agent-only token launchpad on Ink, safety-first.
  *
- * This server wraps the hookit launch MCP (7 tools, zero confirmation gates)
+ * This server wraps the hookit launch MCP (16 tools, zero confirmation gates)
  * with the Foundry safety layer:
  *
  *   Passthrough (always safe, never signs):
  *     foundry_list_presets, foundry_list_modules, foundry_list_pairs,
- *     foundry_wallet_status, foundry_prepare_launch (FORCES dryRun:true)
+ *     foundry_wallet_status, foundry_list_coins, foundry_coin_info,
+ *     foundry_agent_pass_challenge, foundry_prepare_launch (FORCES dryRun:true)
  *
  *   Gated (never execute directly — they write a pending approval):
- *     foundry_request_launch, foundry_request_claim_fees, foundry_request_send_eth
+ *     foundry_request_launch, foundry_request_claim_fees, foundry_request_send_eth,
+ *     foundry_request_claim_agent_pass, foundry_request_buy_token,
+ *     foundry_request_sell_token, foundry_request_redeem_floor,
+ *     foundry_request_borrow_floor, foundry_request_repay_loan
  *     foundry_approve / foundry_reject — the human decision. approve() is the
  *     ONLY path that can sign and broadcast a real transaction.
  *
@@ -27,7 +31,7 @@
  *   FOUNDRY_DB_PATH   SQLite path for approvals + launch records
  *                     (default ./data/foundry.db)
  *
- * Run: npx -y foundry-mcp        (published package)
+ * Run: npx -y 402-foundry-mcp@latest   (published package)
  *      npm run mcp                (from source: npx -y tsx src/server.ts)
  */
 import { pathToFileURL } from 'node:url';
@@ -79,17 +83,41 @@ const launchInputSchema = {
   symbol: z.string().optional().describe('Token symbol, 1-12 letters or digits (or pass ticker)'),
   ticker: z.string().optional().describe('Plain-words alias for symbol'),
   pair: z.string().describe('Quote pair id from foundry_list_pairs (e.g. "eth")'),
+  pairs: z
+    .array(z.string())
+    .optional()
+    .describe(
+      'Multi-pair launch: extra quote pairs beyond `pair` (USDG and stock pairs only, ids from foundry_list_pairs, e.g. ["usdg", "wnvdax"]). Omit for a single-pair launch.',
+    ),
   preset: z.string().optional().describe('Preset id from foundry_list_presets'),
-  modules: z.array(z.string()).optional().describe('Module ids from foundry_list_modules'),
-  hookTaxPct: z.number().min(0).max(100).optional().describe('Extra hook tax %, 0-100'),
+  modules: z
+    .record(z.string(), z.union([z.boolean(), z.number()]))
+    .optional()
+    .describe(
+      'Hook module settings from foundry_list_modules, e.g. {"autoBurn": true, "autoBurnPct": 100}. Omit to use the preset as-is.',
+    ),
+  hookTaxPct: z.number().min(0).max(9).optional().describe('Extra hook tax %, 0-9 (hookit range)'),
   devBuyPct: z.number().min(0).max(2.5).optional().describe('Creator first buy, % of supply, 0-2.5'),
   snipeTaxPct: z
     .number()
     .min(0)
     .max(100)
     .optional()
-    .describe('Opening snipe tax % to DISCLOSE on the launch (standard practice: 90)'),
-  payout: z.string().optional().describe('Fee payout target (wallet address or @handle)'),
+    .describe('Opening snipe tax % to DISCLOSE on the launch (standard practice: 90). Disclosure only — recorded on the launch, not sent to hookit.'),
+  payout: z
+    .union([
+      z.string(),
+      z.object({
+        kind: z.enum(['wallet', 'x', 'github', 'tiktok']),
+        address: z.string().optional(),
+        handle: z.string().optional(),
+        accountId: z.string().optional(),
+      }),
+    ])
+    .optional()
+    .describe(
+      'Fee payout target: a 0x wallet address, an @handle, or {kind, address|handle|accountId}. Default: the launch wallet.',
+    ),
   description: z.string().optional(),
   image: z.string().optional(),
   twitter: z.string().optional(),
@@ -112,7 +140,7 @@ export function createFoundryServer(config: FoundryConfig): McpServer {
   const db = new FoundryDb(config.dbPath);
   const svc = createFoundryService({ db, executor: defaultHookitExecutor });
   const server = new McpServer(
-    { name: 'foundry', version: '0.1.0' },
+    { name: 'foundry', version: '0.2.0' },
     { capabilities: { tools: {} } },
   );
 
@@ -148,6 +176,71 @@ export function createFoundryServer(config: FoundryConfig): McpServer {
     'foundry_wallet_status',
     { description: 'Check whether the launch wallet holds enough ETH to launch. Read-only, plain-words.' },
     safe(() => svc.walletStatus()),
+  );
+
+  server.registerTool(
+    'foundry_list_coins',
+    {
+      description:
+        'Browse hookit coins: newest, top market cap, volume, or 24h gainers. Filter for AI-agent-only, gated, launched-by-agents, Backed Floor, or Boss Raid coins, by pair, or by name. Read-only.',
+      inputSchema: {
+        sort: z.enum(['new', 'marketcap', 'volume', 'gainers']).optional().describe('Default new.'),
+        filter: z
+          .enum(['all', 'ai_agents_only', 'gated', 'launched_by_agents', 'backed_floor', 'boss_raid'])
+          .optional()
+          .describe('ai_agents_only and gated: coins whose launch gate is still closed. Default all.'),
+        pair: z.string().optional().describe('Only coins priced in this pair: "eth", "usdg", "wNVDAx"...'),
+        search: z.string().optional().describe('Part of a name or ticker.'),
+        limit: z.number().int().min(1).max(50).optional().describe('Default 20.'),
+      },
+    },
+    async (args) => {
+      try {
+        return textResult({ ok: true, result: await svc.listCoins(args) });
+      } catch (e) {
+        return errorResult('list_coins failed', (e as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    'foundry_coin_info',
+    {
+      description:
+        "One coin: market data, what it trades in, hooks, Backed Floor price and reserve, loans, launch gate, and the wallet's balance and loans on it. Read-only.",
+      inputSchema: {
+        token: z.string().describe("The coin's 0x address on Ink"),
+      },
+    },
+    async (args) => {
+      try {
+        return textResult({ ok: true, result: await svc.coinInfo(args.token) });
+      } catch (e) {
+        return errorResult('coin_info failed', (e as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    'foundry_agent_pass_challenge',
+    {
+      description:
+        'Step 1 of the Hookit Agent Pass: returns five short tasks plus a challenge id. Answer them via foundry_request_claim_agent_pass (step 2). Pass your ERC-8004 id to start Hookit\'s ERC-8004 validation path instead of a plain pass — the launch wallet must be the identity\'s agent wallet for that path. Read-only, never signs.',
+      inputSchema: {
+        erc8004Id: z
+          .string()
+          .regex(/^\d+$/, 'erc8004Id must be your ERC-8004 agent identity id as a decimal string.')
+          .optional()
+          .describe("Your ERC-8004 agent identity id, for the validation path. Omit for a plain pass check."),
+      },
+    },
+    async (args) => {
+      try {
+        return textResult({ ok: true, result: await svc.agentPassChallenge(args.erc8004Id) });
+      } catch (e) {
+        return errorResult('agent_pass_challenge failed', (e as Error).message);
+      }
+    },
   );
 
   server.registerTool(
@@ -246,6 +339,238 @@ export function createFoundryServer(config: FoundryConfig): McpServer {
     },
   );
 
+  server.registerTool(
+    'foundry_request_claim_agent_pass',
+    {
+      description:
+        'Request claiming the Hookit Agent Pass (step 2 — get the challenge from foundry_agent_pass_challenge first). Does NOT claim: writes a pending approval. Requires your ERC-8004 agent id, which Hookit turns into an ERC-8004 validation published on the ValidationRegistry instead of a plain pass. A human must call foundry_approve before anything is signed.',
+      inputSchema: {
+        erc8004Id: erc8004IdSchema,
+        challengeId: z.string().describe('The challenge id from foundry_agent_pass_challenge'),
+        answers: z
+          .array(z.union([z.string(), z.number()]))
+          .describe('Your answers to the five tasks, in the same order: one short answer per task'),
+        requestHash: z
+          .string()
+          .regex(/^0x[0-9a-fA-F]{64}$/, 'requestHash must be a 0x hash')
+          .optional()
+          .describe('Only with a pre-sent validationRequest: its hash, so Hookit publishes to it.'),
+      },
+    },
+    async (args) => {
+      try {
+        const rec = svc.requestClaimAgentPass({
+          erc8004Id: args.erc8004Id,
+          challengeId: args.challengeId,
+          answers: args.answers,
+          requestHash: args.requestHash,
+        });
+        return textResult({
+          ok: true,
+          approvalId: rec.id,
+          status: rec.status,
+          summary: rec.summary,
+          note: 'Pending human approval. Nothing is signed until foundry_approve is called on this id.',
+        });
+      } catch (e) {
+        return errorResult('request_claim_agent_pass rejected', (e as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    'foundry_request_buy_token',
+    {
+      description:
+        'Request buying a hookit coin. Does NOT buy: writes a pending approval. Requires your ERC-8004 agent id. One buy is capped at 0.5 ETH / $1000 by hookit. A human must call foundry_approve before anything is signed.',
+      inputSchema: {
+        erc8004Id: erc8004IdSchema,
+        token: z.string().describe("The coin's 0x address on Ink"),
+        amount: z
+          .union([z.string(), z.number()])
+          .describe('What to spend, in payWith units: "0.01" (ETH), "25" (USDG), or "50%" of the balance'),
+        payWith: z
+          .string()
+          .optional()
+          .describe('"eth", "usdg", a pair ticker from foundry_list_pairs such as "wNVDAx" or "kBTC", or a token address. Default: the coin\'s own pair.'),
+        slippageBps: z
+          .number()
+          .int()
+          .min(1)
+          .max(5000)
+          .optional()
+          .describe('Max slippage in basis points, 1-5000. Default 500 (5%).'),
+      },
+    },
+    async (args) => {
+      try {
+        const rec = svc.requestBuyToken({
+          erc8004Id: args.erc8004Id,
+          token: args.token,
+          amount: args.amount,
+          payWith: args.payWith,
+          slippageBps: args.slippageBps,
+        });
+        return textResult({
+          ok: true,
+          approvalId: rec.id,
+          status: rec.status,
+          summary: rec.summary,
+          note: 'Pending human approval. Nothing moves until foundry_approve is called on this id.',
+        });
+      } catch (e) {
+        return errorResult('request_buy_token rejected', (e as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    'foundry_request_sell_token',
+    {
+      description:
+        'Request selling a hookit coin. Does NOT sell: writes a pending approval. Requires your ERC-8004 agent id. A human must call foundry_approve before anything is signed.',
+      inputSchema: {
+        erc8004Id: erc8004IdSchema,
+        token: z.string().describe("The coin's 0x address on Ink"),
+        amount: z
+          .union([z.string(), z.number()])
+          .describe('Coins to sell: "1000000", "max" or "50%". "max" keeps 1 wei of the coin.'),
+        receive: z
+          .string()
+          .optional()
+          .describe('"eth", "usdg", a pair ticker such as "wNVDAx" or "kBTC", or a token address. Default: the coin\'s own pair.'),
+        slippageBps: z
+          .number()
+          .int()
+          .min(1)
+          .max(5000)
+          .optional()
+          .describe('Max slippage in basis points, 1-5000. Default 500 (5%).'),
+      },
+    },
+    async (args) => {
+      try {
+        const rec = svc.requestSellToken({
+          erc8004Id: args.erc8004Id,
+          token: args.token,
+          amount: args.amount,
+          receive: args.receive,
+          slippageBps: args.slippageBps,
+        });
+        return textResult({
+          ok: true,
+          approvalId: rec.id,
+          status: rec.status,
+          summary: rec.summary,
+          note: 'Pending human approval. Nothing moves until foundry_approve is called on this id.',
+        });
+      } catch (e) {
+        return errorResult('request_sell_token rejected', (e as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    'foundry_request_redeem_floor',
+    {
+      description:
+        'Request redeeming a Backed Floor coin: burns the coins for their exact floor value from the reserve, no slippage. Does NOT redeem: writes a pending approval. Requires your ERC-8004 agent id. A human must call foundry_approve before anything is signed.',
+      inputSchema: {
+        erc8004Id: erc8004IdSchema,
+        token: z.string().describe("The coin's 0x address on Ink"),
+        amount: z
+          .union([z.string(), z.number()])
+          .describe('Coins to redeem: "1000000", "max" or "50%". "max" keeps 1 wei of the coin.'),
+      },
+    },
+    async (args) => {
+      try {
+        const rec = svc.requestRedeemFloor({
+          erc8004Id: args.erc8004Id,
+          token: args.token,
+          amount: args.amount,
+        });
+        return textResult({
+          ok: true,
+          approvalId: rec.id,
+          status: rec.status,
+          summary: rec.summary,
+          note: 'Pending human approval. Nothing moves until foundry_approve is called on this id.',
+        });
+      } catch (e) {
+        return errorResult('request_redeem_floor rejected', (e as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    'foundry_request_borrow_floor',
+    {
+      description:
+        'Request borrowing against a Backed Floor: locks the coins and pays their floor value minus an upfront fee (1-7%). Repay before expiry to get the coins back. Does NOT borrow: writes a pending approval. Requires your ERC-8004 agent id. A human must call foundry_approve before anything is signed.',
+      inputSchema: {
+        erc8004Id: erc8004IdSchema,
+        token: z.string().describe("The coin's 0x address on Ink"),
+        amount: z
+          .union([z.string(), z.number()])
+          .describe('Coins to lock: "1000000", "50%", or "max" (the most the wallet and the loan cap allow).'),
+        days: z
+          .union([z.literal(7), z.literal(14), z.literal(30), z.literal(60), z.literal(90)])
+          .optional()
+          .describe('Loan length in days. Default 30.'),
+      },
+    },
+    async (args) => {
+      try {
+        const rec = svc.requestBorrowFloor({
+          erc8004Id: args.erc8004Id,
+          token: args.token,
+          amount: args.amount,
+          days: args.days,
+        });
+        return textResult({
+          ok: true,
+          approvalId: rec.id,
+          status: rec.status,
+          summary: rec.summary,
+          note: 'Pending human approval. Nothing moves until foundry_approve is called on this id.',
+        });
+      } catch (e) {
+        return errorResult('request_borrow_floor rejected', (e as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    'foundry_request_repay_loan',
+    {
+      description:
+        'Request repaying a floor loan before expiry to get the locked coins back. Does NOT repay: writes a pending approval. Requires your ERC-8004 agent id. A human must call foundry_approve before anything is signed.',
+      inputSchema: {
+        erc8004Id: erc8004IdSchema,
+        loanId: z
+          .string()
+          .regex(/^[0-9]+$/, 'loanId must be a decimal loan id')
+          .optional()
+          .describe('The loan id from foundry_request_borrow_floor or foundry_wallet_status. Default: the only open loan.'),
+      },
+    },
+    async (args) => {
+      try {
+        const rec = svc.requestRepayLoan({ erc8004Id: args.erc8004Id, loanId: args.loanId });
+        return textResult({
+          ok: true,
+          approvalId: rec.id,
+          status: rec.status,
+          summary: rec.summary,
+          note: 'Pending human approval. Nothing moves until foundry_approve is called on this id.',
+        });
+      } catch (e) {
+        return errorResult('request_repay_loan rejected', (e as Error).message);
+      }
+    },
+  );
+
   // ---- human decisions: the only path to a real transaction ----
 
   server.registerTool(
@@ -257,8 +582,11 @@ export function createFoundryServer(config: FoundryConfig): McpServer {
     },
     async (args) => {
       try {
-        const { approval, result } = await svc.approve(args.approvalId);
-        return textResult({ ok: true, approvalId: approval.id, status: approval.status, result });
+        const { approval, result, feeTx, feeWarning } = await svc.approve(args.approvalId);
+        return textResult({
+          ok: true, approvalId: approval.id, status: approval.status,
+          feeTx, feeWarning, result,
+        });
       } catch (e) {
         return errorResult('approve failed', (e as Error).message);
       }

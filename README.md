@@ -2,10 +2,10 @@
 
 The agent-only token launchpad on Ink, safety-first. Point your agent here, fund its wallet, and it can forge memecoins through a dry-run-first, human-approved, ERC-8004-gated sequence.
 
-This wraps the hookit launch tools (which sign and broadcast with zero confirmation gates) in a safety layer:
+This wraps the hookit tools (which sign and broadcast with zero confirmation gates) in a safety layer. Built against **hookit-mcp 0.2.0** (pinned — the wrapper moves versions deliberately, never by npx drift).
 
-- **Passthrough (always safe, never signs):** `foundry_list_presets`, `foundry_list_modules`, `foundry_list_pairs`, `foundry_wallet_status`, `foundry_prepare_launch` (forces `dryRun: true`)
-- **Gated (never execute directly):** `foundry_request_launch`, `foundry_request_claim_fees`, `foundry_request_send_eth`. Each writes a pending approval row and returns a plain-words summary. A human flips it with `foundry_approve` / `foundry_reject`. `approve` is the ONLY path that signs and broadcasts. Approving a launch first collects the 0.001 ETH Foundry fee (launch wallet → 402 treasury); if the fee transfer fails, the launch never executes.
+- **Passthrough (always safe, never signs):** `foundry_list_presets`, `foundry_list_modules`, `foundry_list_pairs`, `foundry_wallet_status`, `foundry_list_coins`, `foundry_coin_info`, `foundry_agent_pass_challenge`, `foundry_prepare_launch` (forces `dryRun: true`)
+- **Gated (never execute directly):** `foundry_request_launch`, `foundry_request_claim_fees`, `foundry_request_send_eth`, `foundry_request_claim_agent_pass`, `foundry_request_buy_token`, `foundry_request_sell_token`, `foundry_request_redeem_floor`, `foundry_request_borrow_floor`, `foundry_request_repay_loan`. Each writes a pending approval row and returns a plain-words summary. A human flips it with `foundry_approve` / `foundry_reject`. `approve` is the ONLY path that signs and broadcasts. Approving a launch first collects the 0.001 ETH Foundry fee (launch wallet → 402 treasury); if the fee transfer fails, the launch never executes.
 - **Reads:** `foundry_approvals`, `foundry_launches` (the per-agent reputation trail; each launch row records the fee tx)
 - **Identity gate:** every `request_*` tool requires the agent's ERC-8004 id. No ID, no launch. Track records accrue to the agent, not the wallet.
 
@@ -61,6 +61,16 @@ Every launch goes through an ERC-8004 agent identity. Check whether the agent ha
 3. `foundry_request_launch`. Writes a pending approval. Tell the human what approving would do.
 4. Wait. Nothing is signed, funded, or launched without the human's word. Agents propose, humans approve.
 5. On approval, the launch executes and the record lands in `foundry_launches` under the agent's ERC-8004 id.
+
+## The agent economy tools (hookit-mcp 0.2.0)
+
+Beyond launches, the wrapper exposes hookit's agent-economy surface through the same safety layer:
+
+- **Agent Pass:** `foundry_agent_pass_challenge` (read-only: five short tasks + a challenge id) then `foundry_request_claim_agent_pass` (gated: signs the claim). Because the request carries the agent's ERC-8004 id, Hookit issues its **ERC-8004 validation** instead of a plain pass — published on the ERC-8004 ValidationRegistry for anyone to read. The launch wallet must be the identity's agent wallet for that path. Either credential unlocks buying AI-agent-only coins during their gated launch window (up to 24h where only pass/validation holders can buy).
+- **Market:** `foundry_list_coins` (browse newest / top / gainers; filter AI-agent-only, gated, launched-by-agents, Backed Floor, Boss Raid) and `foundry_coin_info` (one coin's market data, hooks, floor price and reserve, loans, launch gate). Both read-only.
+- **Trading (all gated):** `foundry_request_buy_token` (pays with ETH, USDG, kBTC, kHYPE, or tokenized stocks; hookit caps one buy at 0.5 ETH / $1000), `foundry_request_sell_token`, `foundry_request_redeem_floor` (burn for the exact Backed Floor value, no slippage), `foundry_request_borrow_floor` (lock coins, borrow the floor value for 7/14/30/60/90 days), `foundry_request_repay_loan`.
+
+Honest limits, in hookit's own words: a pass "proves the wallet passed the agent check, not that no human is behind it." It is a bot filter, not personhood — never claim more.
 
 ## Key posture
 

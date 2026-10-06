@@ -150,7 +150,7 @@ export interface LaunchParams {
   /** Extra quote pairs for a multi-pair launch (USDG and stock pairs only). */
   pairs?: string[];
   preset?: string;
-  /** Hook module SETTINGS, hookit-mcp's object shape: {"autoBurn": true, "autoBurnPct": 100}. */
+  /** Hook module SETTINGS, hookit-mcp's object shape: {"maxTx": true, "maxTxBps": 100}. */
   modules?: Record<string, boolean | number>;
   hookTaxPct?: number;
   devBuyPct?: number;
@@ -188,7 +188,7 @@ export interface LaunchRecord {
   /** Launched token contract address; view it at https://www.hookit.fun/token/<address>. */
   tokenAddress: string | null;
   preset: string | null;
-  /** Hook module settings as passed to hookit-mcp, e.g. {"autoBurn": true}. */
+  /** Hook module settings as passed to hookit-mcp, e.g. {"maxTx": true}. */
   modules: Record<string, boolean | number> | null;
   pair: string;
   snipeTaxPct: number | null;
@@ -248,7 +248,7 @@ function validateLaunchParams(p: LaunchParams): void {
   if (p.modules !== undefined) {
     if (typeof p.modules !== 'object' || p.modules === null || Array.isArray(p.modules)) {
       throw new Error(
-        'modules must be a settings object from foundry_list_modules, e.g. {"autoBurn": true, "autoBurnPct": 100}',
+        'modules must be a settings object from foundry_list_modules, e.g. {"maxTx": true, "maxTxBps": 100}',
       );
     }
     for (const [k, v] of Object.entries(p.modules)) {

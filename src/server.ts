@@ -94,7 +94,7 @@ const launchInputSchema = {
     .record(z.string(), z.union([z.boolean(), z.number()]))
     .optional()
     .describe(
-      'Hook module settings from foundry_list_modules, e.g. {"autoBurn": true, "autoBurnPct": 100}. Omit to use the preset as-is.',
+      'Hook module settings from foundry_list_modules, e.g. {"maxTx": true, "maxTxBps": 100}. Omit to use the preset as-is.',
     ),
   hookTaxPct: z.number().min(0).max(9).optional().describe('Extra hook tax %, 0-9 (hookit range)'),
   devBuyPct: z.number().min(0).max(2.5).optional().describe('Creator first buy, % of supply, 0-2.5'),

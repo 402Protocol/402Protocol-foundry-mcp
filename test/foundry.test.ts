@@ -571,13 +571,13 @@ await check('prepare_launch: modules object + pairs forwarded, snipeTaxPct strip
   const addr = `0x${'66'.repeat(20)}`;
   await svc.prepareLaunch({
     name: 'Mod Coin', symbol: 'MOD', pair: 'eth', pairs: ['usdg', 'wnvdax'],
-    preset: 'dynamic', modules: { autoBurn: true, autoBurnPct: 100 },
+    preset: 'dynamic', modules: { maxTx: true, maxTxBps: 100 },
     snipeTaxPct: 90, payout: addr,
   });
   assert.equal(mock.calls.length, 1);
   const params = mock.calls[0].params;
   assert.equal(params.dryRun, true);
-  assert.deepEqual(params.modules, { autoBurn: true, autoBurnPct: 100 });
+  assert.deepEqual(params.modules, { maxTx: true, maxTxBps: 100 });
   assert.deepEqual(params.pairs, ['usdg', 'wnvdax']);
   assert.ok(!('snipeTaxPct' in params), 'disclosure metadata never goes over the wire');
   assert.deepEqual(params.payout, { kind: 'wallet', address: addr });
@@ -588,7 +588,7 @@ await check('prepare_launch rejects an array-shaped modules', async () => {
   const db = new FoundryDb(':memory:');
   const { svc } = svcWith(db);
   await assert.rejects(
-    svc.prepareLaunch({ name: 'Bad', symbol: 'BAD', pair: 'eth', modules: ['autoBurn'] as never }),
+    svc.prepareLaunch({ name: 'Bad', symbol: 'BAD', pair: 'eth', modules: ["maxTx"] as never }),
     /modules must be a settings object/,
   );
   db.close();

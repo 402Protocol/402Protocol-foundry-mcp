@@ -4,7 +4,7 @@
  * Tables:
  *   approvals — every gated action request (launch / claim_fees / send_eth /
  *               claim_agent_pass / buy_token / sell_token / redeem_floor /
- *               borrow_floor / repay_loan).
+ *               borrow_floor / repay_loan / evolve_decide / evolve_plug).
  *               Rows start pending; a human flips them to approved/rejected;
  *               execution flips them to executed/failed. The approvals table
  *               IS the audit trail: nothing real happens without a row.
@@ -31,7 +31,9 @@ export type ApprovalKind =
   | 'sell_token'
   | 'redeem_floor'
   | 'borrow_floor'
-  | 'repay_loan';
+  | 'repay_loan'
+  | 'evolve_decide'
+  | 'evolve_plug';
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS approvals (
@@ -59,6 +61,7 @@ CREATE TABLE IF NOT EXISTS launches (
   snipe_tax_pct REAL,
   hook_tax_pct REAL,
   dev_buy_pct REAL,
+  evolve_json TEXT,
   launch_tx TEXT,
   fee_tx TEXT,
   launched_at INTEGER NOT NULL
@@ -92,6 +95,8 @@ export interface LaunchRow {
   snipe_tax_pct: number | null;
   hook_tax_pct: number | null;
   dev_buy_pct: number | null;
+  /** Evolve launch config as passed to hookit-mcp, e.g. {"feePct":1,"maxFeePct":9}. */
+  evolve_json: string | null;
   launch_tx: string | null;
   fee_tx: string | null;
   launched_at: number;
@@ -126,6 +131,11 @@ export class FoundryDb {
     // on hookit.fun (https://www.hookit.fun/token/<address>).
     if (!cols.some((c) => c.name === 'token_address')) {
       this.db.exec(`ALTER TABLE launches ADD COLUMN token_address TEXT`);
+    }
+    // Migration (0.2.2): evolve_json records the Evolve launch config
+    // ({feePct, maxFeePct, potPct}) for Evolve-decider coins.
+    if (!cols.some((c) => c.name === 'evolve_json')) {
+      this.db.exec(`ALTER TABLE launches ADD COLUMN evolve_json TEXT`);
     }
   }
 
@@ -200,6 +210,7 @@ export class FoundryDb {
     snipeTaxPct: number | null;
     hookTaxPct: number | null;
     devBuyPct: number | null;
+    evolveJson: string | null;
     launchTx: string | null;
     feeTx: string | null;
     launchedAt: number;
@@ -208,12 +219,12 @@ export class FoundryDb {
       .prepare(
         `INSERT INTO launches
            (id, erc8004_id, token_name, token_symbol, token_address, preset, modules_json, pair,
-            snipe_tax_pct, hook_tax_pct, dev_buy_pct, launch_tx, fee_tx, launched_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            snipe_tax_pct, hook_tax_pct, dev_buy_pct, evolve_json, launch_tx, fee_tx, launched_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         l.id, l.erc8004Id, l.tokenName, l.tokenSymbol, l.tokenAddress, l.preset, l.modulesJson,
-        l.pair, l.snipeTaxPct, l.hookTaxPct, l.devBuyPct, l.launchTx, l.feeTx, l.launchedAt,
+        l.pair, l.snipeTaxPct, l.hookTaxPct, l.devBuyPct, l.evolveJson, l.launchTx, l.feeTx, l.launchedAt,
       );
   }
 
@@ -264,6 +275,7 @@ function rowToLaunch(row: Record<string, unknown>): LaunchRow {
     snipe_tax_pct: row.snipe_tax_pct as number | null,
     hook_tax_pct: row.hook_tax_pct as number | null,
     dev_buy_pct: row.dev_buy_pct as number | null,
+    evolve_json: (row.evolve_json as string | null) ?? null,
     launch_tx: row.launch_tx as string | null,
     fee_tx: row.fee_tx as string | null,
     launched_at: row.launched_at as number,

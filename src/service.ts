@@ -12,9 +12,10 @@
  *   GATED (never execute directly): request_launch, request_claim_fees,
  *     request_send_eth, request_claim_agent_pass, request_buy_token,
  *     request_sell_token, request_redeem_floor, request_borrow_floor,
- *     request_repay_loan. Each writes a pending row to the approvals table
- *     and returns a plain-words summary of what approving would do. A human
- *     flips the row via approve/reject; only approve() touches the executor.
+ *     request_repay_loan, request_evolve_decide, request_evolve_plug. Each
+ *     writes a pending row to the approvals table and returns a plain-words
+ *     summary of what approving would do. A human flips the row via
+ *     approve/reject; only approve() touches the executor.
  *
  *   IDENTITY GATE: every request_* call requires the agent's ERC-8004 id.
  *     No ID, no launch — the permission lives on the identity, so track
@@ -60,13 +61,13 @@ export const FOUNDRY_FEE_RECIPIENT =
   process.env.FOUNDRY_FEE_RECIPIENT ?? '0xaA4E163dA1545F6967d284C0C5CFA469C644eD23';
 
 /**
- * Default executor: speaks MCP stdio to a `npx -y hookit-mcp@0.2.0` child
+ * Default executor: speaks MCP stdio to a `npx -y hookit-mcp@0.3.0` child
  * process. The version is PINNED: the wrapper is built and tested against
- * hookit-mcp 0.2.0's tool shapes (agent pass, floor redeem/borrow,
- * multi-asset buys). A newer hookit-mcp may change those shapes, so the
- * pin moves deliberately, never by npx drift. Refuses to run when
- * HOOKIT_PRIVATE_KEY is absent — without a key the child cannot sign, and
- * we fail closed instead of half-working.
+ * hookit-mcp 0.3.0's tool shapes (agent pass, floor redeem/borrow,
+ * multi-asset buys, Evolve decider tools). A newer hookit-mcp may change
+ * those shapes, so the pin moves deliberately, never by npx drift. Refuses
+ * to run when HOOKIT_PRIVATE_KEY is absent — without a key the child cannot
+ * sign, and we fail closed instead of half-working.
  */
 export async function defaultHookitExecutor(
   tool: string,
@@ -80,11 +81,11 @@ export async function defaultHookitExecutor(
   }
   const transport = new StdioClientTransport({
     command: 'npx',
-    args: ['-y', 'hookit-mcp@0.2.0'],
+    args: ['-y', 'hookit-mcp@0.3.0'],
     env: process.env as Record<string, string>,
   });
   const client = new Client(
-    { name: 'foundry-executor', version: '0.2.0' },
+    { name: 'foundry-executor', version: '0.3.0' },
     { capabilities: {} },
   );
   await client.connect(transport);
@@ -109,6 +110,8 @@ const KIND_TO_TOOL: Record<ApprovalKind, string> = {
   redeem_floor: 'redeem_floor',
   borrow_floor: 'borrow_against_floor',
   repay_loan: 'repay_loan',
+  evolve_decide: 'evolve_decide',
+  evolve_plug: 'evolve_plug',
 };
 
 /** Creator-fee payout target, hookit-mcp's object shape. */
@@ -154,6 +157,18 @@ export interface LaunchParams {
   modules?: Record<string, boolean | number>;
   hookTaxPct?: number;
   devBuyPct?: number;
+  /**
+   * Evolve: launch the coin with post-launch mutable tokenomics (hookit-mcp
+   * 0.3.0+). A top-level object — NOT a modules key — of the form
+   * { feePct, maxFeePct, potPct } (all optional, {} takes the defaults:
+   * 1% fee, 3% cap, 100% of the pot). The launch wallet becomes the coin's
+   * decider, permanently: it alone moves the fee and the burn/deepen/holders/
+   * creator split after launch (a raise applies after a 1 h public notice, a
+   * cut at once) and plugs up to 8 future hooks. Evolve carries the whole
+   * hook fee, so it cannot combine with hookTaxPct or dynamic fees, and it
+   * is single-pair only.
+   */
+  evolve?: EvolveParams;
   /** Disclosure-only: the opening anti-snipe tax % we tell the human about.
    *  hookit-mcp has no such launch param — it is stripped before the
    *  underlying call and kept on the approval/launch rows. */
@@ -165,6 +180,16 @@ export interface LaunchParams {
   twitter?: string;
   telegram?: string;
   website?: string;
+}
+
+/** Evolve launch config, hookit-mcp 0.3.0's top-level evolve object shape. */
+export interface EvolveParams {
+  /** Evolve's fee on every swap at launch, in %, on top of the 1% base. Default 1. */
+  feePct?: number;
+  /** The most the decider may ever set, 0-9 (plugged hooks share it). Default 3. */
+  maxFeePct?: number;
+  /** Evolve's share of the hook pot, 0.01-100. Default: what the other fee destinations leave (100 with none). */
+  potPct?: number;
 }
 
 export interface ApprovalRecord {
@@ -194,6 +219,8 @@ export interface LaunchRecord {
   snipeTaxPct: number | null;
   hookTaxPct: number | null;
   devBuyPct: number | null;
+  /** Evolve launch config as passed to hookit-mcp, e.g. {"feePct":1,"maxFeePct":9}. */
+  evolve: EvolveParams | null;
   launchTx: string | null;
   feeTx: string | null;
   launchedAt: number;
@@ -267,6 +294,43 @@ function validateLaunchParams(p: LaunchParams): void {
   }
   if (p.snipeTaxPct !== undefined && (p.snipeTaxPct < 0 || p.snipeTaxPct > 100)) {
     throw new Error('snipeTaxPct must be between 0 and 100');
+  }
+  if (p.evolve !== undefined) {
+    validateEvolveParams(p.evolve);
+    // Evolve carries the whole hook fee: hookit's own combination rules.
+    if (p.hookTaxPct !== undefined && p.hookTaxPct !== 0) {
+      throw new Error('evolve cannot combine with hookTaxPct: Evolve carries the whole hook fee (hook tax 0)');
+    }
+    if (p.modules && (p.modules as Record<string, unknown>).dynamicFees) {
+      throw new Error('evolve cannot combine with dynamic fees: turn dynamicFees off');
+    }
+    if (p.pairs !== undefined && p.pairs.length > 0) {
+      throw new Error('evolve is single-pair only: omit pairs');
+    }
+  }
+}
+
+/** Validate the top-level Evolve launch object (hookit-mcp 0.3.0 shape). */
+function validateEvolveParams(e: unknown): asserts e is EvolveParams {
+  if (typeof e !== 'object' || e === null || Array.isArray(e)) {
+    throw new Error('evolve must be an object like {feePct: 1, maxFeePct: 9} ({} for the defaults)');
+  }
+  const { feePct, maxFeePct, potPct } = e as Record<string, unknown>;
+  if (feePct !== undefined && (typeof feePct !== 'number' || feePct < 0 || feePct > 9)) {
+    throw new Error('evolve.feePct must be between 0 and 9');
+  }
+  if (maxFeePct !== undefined && (typeof maxFeePct !== 'number' || maxFeePct < 0 || maxFeePct > 9)) {
+    throw new Error('evolve.maxFeePct must be between 0 and 9');
+  }
+  if (
+    feePct !== undefined &&
+    maxFeePct !== undefined &&
+    (feePct as number) > (maxFeePct as number)
+  ) {
+    throw new Error('evolve.feePct cannot exceed evolve.maxFeePct (the cap is fixed at launch)');
+  }
+  if (potPct !== undefined && (typeof potPct !== 'number' || potPct < 0.01 || potPct > 100)) {
+    throw new Error('evolve.potPct must be between 0.01 and 100');
   }
 }
 
@@ -413,6 +477,7 @@ export function createFoundryService(opts: FoundryServiceOptions) {
       snipeTaxPct: row.snipe_tax_pct,
       hookTaxPct: row.hook_tax_pct,
       devBuyPct: row.dev_buy_pct,
+      evolve: row.evolve_json ? (JSON.parse(row.evolve_json) as EvolveParams) : null,
       launchTx: row.launch_tx,
       feeTx: row.fee_tx,
       launchedAt: row.launched_at,
@@ -451,6 +516,7 @@ export function createFoundryService(opts: FoundryServiceOptions) {
       snipeTaxPct: params.snipeTaxPct ?? null,
       hookTaxPct: params.hookTaxPct ?? null,
       devBuyPct: params.devBuyPct ?? null,
+      evolveJson: params.evolve ? JSON.stringify(params.evolve) : null,
       launchTx,
       feeTx,
       launchedAt: ts,
@@ -513,6 +579,21 @@ export function createFoundryService(opts: FoundryServiceOptions) {
     coinInfo: (token: string) => executor('coin_info', { token: requireTokenAddress(token) }),
 
     /**
+     * Evolve state of a coin: its decider and whether the launch wallet is
+     * that decider, the live fee and split, any announced change and when it
+     * applies, the caps fixed at launch, lifetime burn/LP/airdrop/creator
+     * totals, and the plugged hooks. Read-only — never signs.
+     */
+    evolveStatus: (token: string) =>
+      executor('evolve_status', { token: requireTokenAddress(token) }),
+
+    /**
+     * The hooks Hookit has listed for Evolve coins: what each does with its
+     * share, its fee cap, gas and status. Read-only — never signs.
+     */
+    evolveHooks: () => executor('evolve_hooks', {}),
+
+    /**
      * Step 1 of the Agent Pass: returns five short tasks plus a challenge
      * id. Answer them with foundry_request_claim_agent_pass (step 2).
      * With an ERC-8004 id, starts Hookit's ERC-8004 validation path instead
@@ -568,9 +649,15 @@ export function createFoundryService(opts: FoundryServiceOptions) {
         ? `, modules {${moduleEntries.map(([k, v]) => `${k}: ${v}`).join(', ')}}`
         : '';
       const pairs = p.pairs?.length ? `, extra pairs [${p.pairs.join(', ')}]` : '';
+      const evolve = p.evolve
+        ? `, EVOLVE {fee ${p.evolve.feePct ?? 1}% at launch, cap ${p.evolve.maxFeePct ?? 3}%}: ` +
+          `the launch wallet becomes the coin's PERMANENT decider — it alone moves the fee and the ` +
+          `burn/deepen-LP/holder-airdrop/creator split after launch (a raise applies after a 1 h public ` +
+          `notice, a cut at once) and plugs up to 8 future hooks. Every decision is public onchain.`
+        : '';
       const summary =
         `Launch request: agent ${erc8004Id} wants to launch "${p.name}" (${p.symbol}) ` +
-        `on pair ${p.pair}${pairs} with preset "${p.preset ?? 'default'}"${modules}. ` +
+        `on pair ${p.pair}${pairs} with preset "${p.preset ?? 'default'}"${modules}${evolve}. ` +
         `Hook tax ${p.hookTaxPct ?? 0}%, dev buy ${p.devBuyPct ?? 0}%, ` +
         `opening snipe tax DISCLOSED at ${p.snipeTaxPct ?? 90}% (standard practice). ` +
         `Approving SIGNs and BROADCASTs a real launch transaction on Ink — ` +
@@ -756,6 +843,162 @@ export function createFoundryService(opts: FoundryServiceOptions) {
         `Approving SIGNS and BROADCASTs the repayment on Ink. ` +
         `Nothing moves until a human approves.`;
       return storeRequest('repay_loan', erc8004Id, params, summary);
+    },
+
+    /**
+     * Request an Evolve decision as the coin's decider: move Evolve's fee
+     * and/or the split of Evolve's fees between burn, deepen LP, holder
+     * airdrop and creator. Only the decider wallet (the one that launched
+     * the coin with Evolve) can do this — anyone else gets a refusal from
+     * the launcher. A move that raises neither the fee nor the creator share
+     * applies at once; a raise is announced first and applies after the
+     * coin's notice (1 h by default), so holders see it coming. The reason
+     * is public onchain, plain text. Does NOT decide: writes a pending
+     * approval. A human must call foundry_approve before anything is signed.
+     */
+    requestEvolveDecide: (p: {
+      erc8004Id: string;
+      token: string;
+      feePct?: number;
+      burnPct?: number;
+      deepenPct?: number;
+      holdersPct?: number;
+      creatorPct?: number;
+      reason?: string;
+      cancel?: boolean;
+    }) => {
+      const erc8004Id = requireErc8004Id(p.erc8004Id);
+      const token = requireTokenAddress(p.token);
+      const params: Record<string, unknown> = { token };
+      if (p.cancel === true) {
+        for (const k of ['feePct', 'burnPct', 'deepenPct', 'holdersPct', 'creatorPct', 'reason'] as const) {
+          if (p[k] !== undefined) throw new Error(`cancel: true takes no ${k}`);
+        }
+        params.cancel = true;
+      } else {
+        if (p.cancel !== undefined) throw new Error('cancel must be true or omitted');
+        const splitKeys = ['burnPct', 'deepenPct', 'holdersPct', 'creatorPct'] as const;
+        const splitGiven = splitKeys.filter((k) => p[k] !== undefined);
+        if (p.feePct === undefined && splitGiven.length === 0) {
+          throw new Error('evolve_decide needs something to move: feePct, a full split (burn/deepen/holders/creator), or cancel: true');
+        }
+        if (p.feePct !== undefined) {
+          if (typeof p.feePct !== 'number' || p.feePct < 0 || p.feePct > 9) {
+            throw new Error('feePct must be between 0 and 9 (and within the launch cap)');
+          }
+          params.feePct = p.feePct;
+        }
+        if (splitGiven.length > 0) {
+          if (splitGiven.length !== 4) {
+            throw new Error('the Evolve split moves as a whole: pass burnPct, deepenPct, holdersPct and creatorPct together');
+          }
+          let total = 0;
+          for (const k of splitKeys) {
+            const v = p[k] as number;
+            if (typeof v !== 'number' || v < 0 || v > 100) {
+              throw new Error(`${k} must be between 0 and 100`);
+            }
+            total += v;
+          }
+          if (Math.abs(total - 100) > 1e-9) {
+            throw new Error(`the Evolve split must total 100 (got ${total})`);
+          }
+          if ((p.creatorPct as number) > 20) {
+            throw new Error('creatorPct cannot exceed 20 (protocol cap)');
+          }
+          params.burnPct = p.burnPct;
+          params.deepenPct = p.deepenPct;
+          params.holdersPct = p.holdersPct;
+          params.creatorPct = p.creatorPct;
+        }
+        if (p.reason !== undefined) {
+          if (typeof p.reason !== 'string' || !p.reason.trim()) {
+            throw new Error('reason must be a non-empty string');
+          }
+          if (Buffer.byteLength(p.reason, 'utf8') > 560) {
+            throw new Error('reason is public onchain and limited to 560 bytes');
+          }
+          params.reason = p.reason;
+        }
+      }
+      const what = p.cancel === true
+        ? 'CANCEL the announced Evolve setting'
+        : [
+            p.feePct !== undefined ? `fee to ${p.feePct}%` : null,
+            p.burnPct !== undefined
+              ? `split to burn ${p.burnPct} / deepen ${p.deepenPct} / holders ${p.holdersPct} / creator ${p.creatorPct}`
+              : null,
+          ].filter(Boolean).join(' and ');
+      const summary =
+        `Evolve-decision request: agent ${erc8004Id} (decider wallet) wants to ${what} on ${token}. ` +
+        `A move that raises neither the fee nor the creator share applies at once; a raise is announced ` +
+        `first and applies after the coin's notice (1 h by default). The reason is public onchain. ` +
+        `Only the decider wallet can do this — any other wallet is refused. ` +
+        `Approving SIGNS and BROADCASTs the decision on Ink. Nothing moves until a human approves.`;
+      return storeRequest('evolve_decide', erc8004Id, params, summary);
+    },
+
+    /**
+     * Request plugging a hook into an Evolve coin's 8 slots (or replacing /
+     * unplugging one). Only the decider wallet can do this. The change
+     * applies after the coin's notice. Hooks only move money — they never
+     * block or change a trade. Does NOT plug: writes a pending approval.
+     * A human must call foundry_approve before anything is signed.
+     */
+    requestEvolvePlug: (p: {
+      erc8004Id: string;
+      token: string;
+      slot: number;
+      hookId?: number;
+      sharePct?: number;
+      config?: string;
+      unplug?: boolean;
+      cancel?: boolean;
+    }) => {
+      const erc8004Id = requireErc8004Id(p.erc8004Id);
+      const token = requireTokenAddress(p.token);
+      if (!Number.isInteger(p.slot) || p.slot < 1 || p.slot > 8) {
+        throw new Error('slot must be an integer 1-8 (see foundry_evolve_status for used slots)');
+      }
+      const params: Record<string, unknown> = { token, slot: p.slot };
+      const mode = p.unplug === true ? 'unplug' : p.cancel === true ? 'cancel' : 'plug';
+      if (mode !== 'plug') {
+        for (const k of ['hookId', 'sharePct', 'config'] as const) {
+          if (p[k] !== undefined) throw new Error(`${mode}: true takes no ${k}`);
+        }
+        params[mode] = true;
+      } else {
+        if (p.unplug !== undefined || p.cancel !== undefined) {
+          throw new Error('unplug/cancel must be true or omitted');
+        }
+        if (p.hookId === undefined || !Number.isInteger(p.hookId) || p.hookId < 0) {
+          throw new Error('hookId is required: pick it from foundry_evolve_hooks (integer >= 0)');
+        }
+        params.hookId = p.hookId;
+        if (p.sharePct !== undefined) {
+          if (typeof p.sharePct !== 'number' || p.sharePct < 0 || p.sharePct > 100) {
+            throw new Error('sharePct must be between 0 and 100');
+          }
+          params.sharePct = p.sharePct;
+        }
+        if (p.config !== undefined) {
+          if (typeof p.config !== 'string' || !/^0x[0-9a-fA-F]*$/.test(p.config)) {
+            throw new Error('config must be 0x ABI-encoded hex for the hook');
+          }
+          params.config = p.config;
+        }
+      }
+      const what = mode === 'plug'
+        ? `plug hook ${p.hookId} into slot ${p.slot}${p.sharePct !== undefined ? ` with ${p.sharePct}% of Evolve's fees` : ''}`
+        : mode === 'unplug'
+          ? `unplug slot ${p.slot}`
+          : `cancel the announced change on slot ${p.slot}`;
+      const summary =
+        `Evolve-plug request: agent ${erc8004Id} (decider wallet) wants to ${what} on ${token}. ` +
+        `The change applies after the coin's notice (1 h by default). Hooks only move money — ` +
+        `they never block or change a trade. Only the decider wallet can do this. ` +
+        `Approving SIGNS and BROADCASTs on Ink. Nothing moves until a human approves.`;
+      return storeRequest('evolve_plug', erc8004Id, params, summary);
     },
 
     // ---- human decisions ----

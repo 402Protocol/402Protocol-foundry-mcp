@@ -135,13 +135,13 @@ await check('db: launches insert → list all + by erc8004 id', () => {
   db.insertLaunch({
     id: 'lnch_1', erc8004Id: '4076', tokenName: 'Test Coin', tokenSymbol: 'TST',
     tokenAddress: `0x${'11'.repeat(20)}`, preset: 'floor', modulesJson: JSON.stringify(['backed-floor']), pair: 'eth',
-    snipeTaxPct: 90, hookTaxPct: 5, devBuyPct: 1,
+    snipeTaxPct: 90, hookTaxPct: 5, devBuyPct: 1, evolveJson: null,
     launchTx: `0x${'ab'.repeat(32)}`, feeTx: `0x${'cd'.repeat(32)}`, launchedAt: NOW,
   });
   db.insertLaunch({
     id: 'lnch_2', erc8004Id: '9999', tokenName: 'Other', tokenSymbol: 'OTH',
     tokenAddress: null, preset: null, modulesJson: null, pair: 'usdg',
-    snipeTaxPct: null, hookTaxPct: null, devBuyPct: null,
+    snipeTaxPct: null, hookTaxPct: null, devBuyPct: null, evolveJson: JSON.stringify({ feePct: 1, maxFeePct: 9 }),
     launchTx: null, feeTx: null, launchedAt: NOW + 1,
   });
   assert.equal(db.listLaunches().length, 2);
@@ -150,6 +150,9 @@ await check('db: launches insert → list all + by erc8004 id', () => {
   assert.equal(mine[0].token_symbol, 'TST');
   assert.equal(mine[0].launch_tx, `0x${'ab'.repeat(32)}`);
   assert.equal(mine[0].fee_tx, `0x${'cd'.repeat(32)}`);
+  assert.equal(mine[0].evolve_json, null);
+  const other = db.listLaunches('9999');
+  assert.equal(other[0].evolve_json, JSON.stringify({ feePct: 1, maxFeePct: 9 }));
   db.close();
 });
 
@@ -711,6 +714,183 @@ await check('approve(launch): snipeTaxPct stripped from the wire, kept on the ro
   const row = svc.listLaunches()[0];
   assert.equal(row.snipeTaxPct, 90);
   assert.ok(launchCall.params.dryRun !== true);
+  db.close();
+});
+
+// ---------- evolve (0.2.2) ----------
+
+function evolveLaunchArgs(over: Record<string, unknown> = {}) {
+  return {
+    erc8004Id: '4894',
+    name: 'Quill',
+    symbol: 'QL',
+    pair: 'eth',
+    modules: { antiMev: true, antiSnipe: true, antiSnipeInitialTax: 98, antiSnipeDuration: 20 },
+    devBuyPct: 2.5,
+    snipeTaxPct: 98,
+    evolve: { feePct: 1, maxFeePct: 9 },
+    ...over,
+  };
+}
+
+await check('evolve: launch validation rejects hookit-forbidden combinations', () => {
+  const db = new FoundryDb(':memory:');
+  const { svc } = svcWith(db);
+  assert.throws(
+    () => svc.requestLaunch({ ...evolveLaunchArgs(), hookTaxPct: 3 } as any),
+    /cannot combine with hookTaxPct/,
+  );
+  assert.throws(
+    () => svc.requestLaunch(evolveLaunchArgs({ modules: { dynamicFees: true, dynamicFeeMinBps: 300, dynamicFeeMaxBps: 500 } })),
+    /cannot combine with dynamic fees/,
+  );
+  assert.throws(
+    () => svc.requestLaunch(evolveLaunchArgs({ pairs: ['usdg'] })),
+    /single-pair only/,
+  );
+  assert.throws(
+    () => svc.requestLaunch(evolveLaunchArgs({ evolve: { feePct: 5, maxFeePct: 3 } })),
+    /cannot exceed.*maxFeePct/,
+  );
+  assert.throws(
+    () => svc.requestLaunch(evolveLaunchArgs({ evolve: { maxFeePct: 10 } })),
+    /maxFeePct must be between 0 and 9/,
+  );
+  assert.throws(
+    () => svc.requestLaunch(evolveLaunchArgs({ evolve: 'yes' })),
+    /must be an object/,
+  );
+  db.close();
+});
+
+await check('evolve: valid launch passes validation, evolve goes over the wire, recorded on the row', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc, mock } = svcWith(db);
+  const { result } = await svc.prepareLaunch(evolveLaunchArgs() as any);
+  assert.ok(result, 'dry run returns');
+  const dryCall = mock.calls.find((c) => c.tool === 'launch_token' && c.params.dryRun === true)!;
+  assert.deepEqual(dryCall.params.evolve, { feePct: 1, maxFeePct: 9 });
+  const rec = svc.requestLaunch(evolveLaunchArgs() as any);
+  assert.match(rec.summary, /PERMANENT decider/);
+  await svc.approve(rec.id);
+  const row = svc.listLaunches('4894')[0];
+  assert.deepEqual(row.evolve, { feePct: 1, maxFeePct: 9 });
+  const liveCall = mock.calls.find((c) => c.tool === 'launch_token' && !c.params.dryRun)!;
+  assert.deepEqual(liveCall.params.evolve, { feePct: 1, maxFeePct: 9 });
+  db.close();
+});
+
+await check('evolve: {} takes hookit defaults', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc } = svcWith(db);
+  const rec = svc.requestLaunch(evolveLaunchArgs({ evolve: {} }) as any);
+  assert.match(rec.summary, /cap 3%/);
+  db.close();
+});
+
+await check('evolve_decide: validation (split wholeness, 100 total, creator cap, cancel exclusivity)', () => {
+  const db = new FoundryDb(':memory:');
+  const { svc } = svcWith(db);
+  const token = `0x${'aa'.repeat(20)}`;
+  const base = { erc8004Id: '4894', token };
+  assert.throws(() => svc.requestEvolveDecide(base as any), /needs something to move/);
+  assert.throws(
+    () => svc.requestEvolveDecide({ ...base, burnPct: 50 } as any),
+    /moves as a whole/,
+  );
+  assert.throws(
+    () => svc.requestEvolveDecide({ ...base, burnPct: 50, deepenPct: 20, holdersPct: 20, creatorPct: 5 } as any),
+    /must total 100/,
+  );
+  assert.throws(
+    () => svc.requestEvolveDecide({ ...base, burnPct: 40, deepenPct: 20, holdersPct: 10, creatorPct: 30 } as any),
+    /cannot exceed 20/,
+  );
+  assert.throws(
+    () => svc.requestEvolveDecide({ ...base, cancel: true, feePct: 2 } as any),
+    /takes no feePct/,
+  );
+  assert.throws(
+    () => svc.requestEvolveDecide({ ...base, feePct: 10 } as any),
+    /feePct must be between 0 and 9/,
+  );
+  assert.throws(() => svc.requestEvolveDecide({ erc8004Id: '', token } as any), /erc8004Id is required/);
+  assert.throws(() => svc.requestEvolveDecide({ erc8004Id: '4894', token: 'nope' } as any), /0x coin address/);
+  db.close();
+});
+
+await check('evolve_decide: fee-only move and full split route to evolve_decide on approve', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc, mock } = svcWith(db);
+  const token = `0x${'aa'.repeat(20)}`;
+  const feeOnly = svc.requestEvolveDecide({ erc8004Id: '4894', token, feePct: 2, reason: 'calm the market' });
+  assert.match(feeOnly.summary, /fee to 2%/);
+  await svc.approve(feeOnly.id);
+  const split = svc.requestEvolveDecide({
+    erc8004Id: '4894', token,
+    burnPct: 34, deepenPct: 33, holdersPct: 33, creatorPct: 0,
+  });
+  await svc.approve(split.id);
+  const cancel = svc.requestEvolveDecide({ erc8004Id: '4894', token, cancel: true });
+  await svc.approve(cancel.id);
+  assert.deepEqual(
+    mock.calls.map((c) => c.tool),
+    ['evolve_decide', 'evolve_decide', 'evolve_decide'],
+  );
+  assert.deepEqual(mock.calls[0].params, { token, feePct: 2, reason: 'calm the market' });
+  assert.deepEqual(mock.calls[1].params, { token, burnPct: 34, deepenPct: 33, holdersPct: 33, creatorPct: 0 });
+  assert.deepEqual(mock.calls[2].params, { token, cancel: true });
+  db.close();
+});
+
+await check('evolve_plug: validation (slot range, mode exclusivity)', () => {
+  const db = new FoundryDb(':memory:');
+  const { svc } = svcWith(db);
+  const token = `0x${'aa'.repeat(20)}`;
+  const base = { erc8004Id: '4894', token };
+  assert.throws(() => svc.requestEvolvePlug({ ...base, slot: 0, hookId: 1 } as any), /slot must be an integer 1-8/);
+  assert.throws(() => svc.requestEvolvePlug({ ...base, slot: 9, hookId: 1 } as any), /slot must be an integer 1-8/);
+  assert.throws(() => svc.requestEvolvePlug({ ...base, slot: 1 } as any), /hookId is required/);
+  assert.throws(
+    () => svc.requestEvolvePlug({ ...base, slot: 1, unplug: true, hookId: 2 } as any),
+    /unplug: true takes no hookId/,
+  );
+  assert.throws(
+    () => svc.requestEvolvePlug({ ...base, slot: 1, hookId: 2, sharePct: 101 } as any),
+    /sharePct must be between 0 and 100/,
+  );
+  assert.throws(
+    () => svc.requestEvolvePlug({ ...base, slot: 1, hookId: 2, config: 'zzz' } as any),
+    /0x ABI-encoded hex/,
+  );
+  db.close();
+});
+
+await check('evolve_plug: plug and unplug route to evolve_plug on approve', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc, mock } = svcWith(db);
+  const token = `0x${'aa'.repeat(20)}`;
+  const plug = svc.requestEvolvePlug({ erc8004Id: '4894', token, slot: 1, hookId: 3, sharePct: 30 });
+  assert.match(plug.summary, /plug hook 3 into slot 1/);
+  await svc.approve(plug.id);
+  const unplug = svc.requestEvolvePlug({ erc8004Id: '4894', token, slot: 1, unplug: true });
+  await svc.approve(unplug.id);
+  assert.deepEqual(mock.calls.map((c) => c.tool), ['evolve_plug', 'evolve_plug']);
+  assert.deepEqual(mock.calls[0].params, { token, slot: 1, hookId: 3, sharePct: 30 });
+  assert.deepEqual(mock.calls[1].params, { token, slot: 1, unplug: true });
+  db.close();
+});
+
+await check('evolve: read-only passthroughs route correctly', async () => {
+  const db = new FoundryDb(':memory:');
+  const { svc, mock } = svcWith(db);
+  const token = `0x${'aa'.repeat(20)}`;
+  await svc.evolveStatus(token);
+  await svc.evolveHooks();
+  assert.deepEqual(mock.calls.map((c) => c.tool), ['evolve_status', 'evolve_hooks']);
+  assert.deepEqual(mock.calls[0].params, { token });
+  assert.deepEqual(mock.calls[1].params, {});
+  assert.throws(() => svc.evolveStatus('nope'), /0x coin address/);
   db.close();
 });
 

@@ -1,19 +1,21 @@
 /**
  * Foundry MCP server — the agent-only token launchpad on Ink, safety-first.
  *
- * This server wraps the hookit launch MCP (16 tools, zero confirmation gates)
+ * This server wraps the hookit launch MCP (zero confirmation gates)
  * with the Foundry safety layer:
  *
  *   Passthrough (always safe, never signs):
  *     foundry_list_presets, foundry_list_modules, foundry_list_pairs,
  *     foundry_wallet_status, foundry_list_coins, foundry_coin_info,
- *     foundry_agent_pass_challenge, foundry_prepare_launch (FORCES dryRun:true)
+ *     foundry_agent_pass_challenge, foundry_prepare_launch (FORCES dryRun:true),
+ *     foundry_evolve_status, foundry_evolve_hooks
  *
  *   Gated (never execute directly — they write a pending approval):
  *     foundry_request_launch, foundry_request_claim_fees, foundry_request_send_eth,
  *     foundry_request_claim_agent_pass, foundry_request_buy_token,
  *     foundry_request_sell_token, foundry_request_redeem_floor,
- *     foundry_request_borrow_floor, foundry_request_repay_loan
+ *     foundry_request_borrow_floor, foundry_request_repay_loan,
+ *     foundry_request_evolve_decide, foundry_request_evolve_plug
  *     foundry_approve / foundry_reject — the human decision. approve() is the
  *     ONLY path that can sign and broadcast a real transaction.
  *
@@ -96,8 +98,18 @@ const launchInputSchema = {
     .describe(
       'Hook module settings from foundry_list_modules, e.g. {"maxTx": true, "maxTxBps": 100}. Omit to use the preset as-is.',
     ),
-  hookTaxPct: z.number().min(0).max(9).optional().describe('Extra hook tax %, 0-9 (hookit range)'),
+  hookTaxPct: z.number().min(0).max(9).optional().describe('Extra hook tax %, 0-9 (hookit range). Cannot combine with evolve.'),
   devBuyPct: z.number().min(0).max(2.5).optional().describe('Creator first buy, % of supply, 0-2.5'),
+  evolve: z
+    .object({
+      feePct: z.number().min(0).max(9).optional().describe("Evolve's fee on every swap at launch, in %, on top of the 1% base. Default 1."),
+      maxFeePct: z.number().min(0).max(9).optional().describe('The most the decider may ever set, 0-9. FIXED at launch — default 3.'),
+      potPct: z.number().min(0.01).max(100).optional().describe("Evolve's share of the hook pot. Default 100."),
+    })
+    .optional()
+    .describe(
+      'Launch with Evolve (Hookit V2): the launch wallet becomes the coin\'s PERMANENT decider and moves the fee and the burn/deepen-LP/holder-airdrop/creator split after launch (a raise applies after a 1 h public notice, a cut at once), plus up to 8 future hook slots. {} takes the defaults. Cannot combine with hookTaxPct or dynamic fees; single-pair only.',
+    ),
   snipeTaxPct: z
     .number()
     .min(0)
@@ -140,7 +152,7 @@ export function createFoundryServer(config: FoundryConfig): McpServer {
   const db = new FoundryDb(config.dbPath);
   const svc = createFoundryService({ db, executor: defaultHookitExecutor });
   const server = new McpServer(
-    { name: 'foundry', version: '0.2.1' },
+    { name: 'foundry', version: '0.2.2' },
     { capabilities: { tools: {} } },
   );
 
@@ -219,6 +231,34 @@ export function createFoundryServer(config: FoundryConfig): McpServer {
         return errorResult('coin_info failed', (e as Error).message);
       }
     },
+  );
+
+  server.registerTool(
+    'foundry_evolve_status',
+    {
+      description:
+        "Evolve state of a coin: its decider (the wallet that launched it, the only one that can change it) and whether the launch wallet is that decider, the live fee and split, any announced change and when it applies, the caps fixed at launch, lifetime totals, and the plugged hooks. Read-only, never signs.",
+      inputSchema: {
+        token: z.string().describe("The coin's 0x address on Ink"),
+      },
+    },
+    async (args) => {
+      try {
+        return textResult({ ok: true, result: await svc.evolveStatus(args.token) });
+      } catch (e) {
+        return errorResult('evolve_status failed', (e as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    'foundry_evolve_hooks',
+    {
+      description:
+        'The hooks Hookit has listed for Evolve coins: what each does with its share, its fee cap, gas and status. Read-only, never signs.',
+      inputSchema: {},
+    },
+    safe(() => svc.evolveHooks()),
   );
 
   server.registerTool(
@@ -572,6 +612,90 @@ export function createFoundryServer(config: FoundryConfig): McpServer {
   );
 
   // ---- human decisions: the only path to a real transaction ----
+
+  server.registerTool(
+    'foundry_request_evolve_decide',
+    {
+      description:
+        "Request an Evolve decision as the coin's decider: move Evolve's fee and/or the split of Evolve's fees between burn, deepen LP, holder airdrop and creator (creator at most 20%). Only the decider wallet (the one that launched the coin with Evolve) can do this. A raise applies after the coin's notice (1 h by default), anything else at once; the reason is public onchain. Does NOT decide: writes a pending approval. Requires your ERC-8004 agent id. A human must call foundry_approve before anything is signed.",
+      inputSchema: {
+        erc8004Id: erc8004IdSchema,
+        token: z.string().describe("The Evolve coin's 0x address on Ink"),
+        feePct: z.number().min(0).max(9).optional().describe("Evolve's fee on every swap, in %, within the launch cap. Omit to keep the live fee."),
+        burnPct: z.number().min(0).max(100).optional().describe('Share of Evolve fees buying back and burning the coin. The split moves as a whole: pass all four or none.'),
+        deepenPct: z.number().min(0).max(100).optional().describe("Share deepening the coin's locked liquidity. The split moves as a whole: pass all four or none."),
+        holdersPct: z.number().min(0).max(100).optional().describe('Share airdropped to holders. The split moves as a whole: pass all four or none.'),
+        creatorPct: z.number().min(0).max(20).optional().describe('Share credited to the creator, at most 20. The split moves as a whole: pass all four or none.'),
+        reason: z.string().max(560).optional().describe('Why, in one or two sentences. Public onchain, plain text.'),
+        cancel: z.boolean().optional().describe('Drop the announced setting instead (takes nothing else).'),
+      },
+    },
+    async (args) => {
+      try {
+        const rec = svc.requestEvolveDecide({
+          erc8004Id: args.erc8004Id,
+          token: args.token,
+          feePct: args.feePct,
+          burnPct: args.burnPct,
+          deepenPct: args.deepenPct,
+          holdersPct: args.holdersPct,
+          creatorPct: args.creatorPct,
+          reason: args.reason,
+          cancel: args.cancel,
+        });
+        return textResult({
+          ok: true,
+          approvalId: rec.id,
+          status: rec.status,
+          summary: rec.summary,
+          note: 'Pending human approval. Nothing moves until foundry_approve is called on this id.',
+        });
+      } catch (e) {
+        return errorResult('request_evolve_decide rejected', (e as Error).message);
+      }
+    },
+  );
+
+  server.registerTool(
+    'foundry_request_evolve_plug',
+    {
+      description:
+        "Request plugging a hook into an Evolve coin's 8 slots (or replacing / unplugging one). Only the decider wallet can do this; the change applies after the coin's notice. Hooks only move money, never block or change a trade. Does NOT plug: writes a pending approval. Requires your ERC-8004 agent id. A human must call foundry_approve before anything is signed.",
+      inputSchema: {
+        erc8004Id: erc8004IdSchema,
+        token: z.string().describe("The Evolve coin's 0x address on Ink"),
+        slot: z.number().int().min(1).max(8).describe('Slot number 1-8 (see foundry_evolve_status for used slots)'),
+        hookId: z.number().int().min(0).optional().describe('The hook to plug, from foundry_evolve_hooks. Omit with unplug/cancel.'),
+        sharePct: z.number().min(0).max(100).optional().describe("Share of Evolve's fees the hook spends, 0-100."),
+        config: z.string().optional().describe("The hook's own settings, 0x ABI-encoded hex (default 0x)."),
+        unplug: z.boolean().optional().describe('Empty the slot after the notice instead (takes nothing else).'),
+        cancel: z.boolean().optional().describe("Drop the slot's announced change instead (takes nothing else)."),
+      },
+    },
+    async (args) => {
+      try {
+        const rec = svc.requestEvolvePlug({
+          erc8004Id: args.erc8004Id,
+          token: args.token,
+          slot: args.slot,
+          hookId: args.hookId,
+          sharePct: args.sharePct,
+          config: args.config,
+          unplug: args.unplug,
+          cancel: args.cancel,
+        });
+        return textResult({
+          ok: true,
+          approvalId: rec.id,
+          status: rec.status,
+          summary: rec.summary,
+          note: 'Pending human approval. Nothing moves until foundry_approve is called on this id.',
+        });
+      } catch (e) {
+        return errorResult('request_evolve_plug rejected', (e as Error).message);
+      }
+    },
+  );
 
   server.registerTool(
     'foundry_approve',
